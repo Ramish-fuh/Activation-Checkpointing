@@ -8,12 +8,12 @@ echo "=================================================="
 
 # Check if virtual environment is activated
 if [[ "$VIRTUAL_ENV" == "" ]]; then
-    echo "⚠️  Virtual environment not activated!"
+    echo "WARNING: Virtual environment not activated!"
     echo "Please run: source systemProject/bin/activate"
     exit 1
 fi
 
-echo "✓ Virtual environment activated"
+echo "[OK] Virtual environment activated"
 
 # Install dependencies
 echo ""
@@ -21,9 +21,9 @@ echo "Installing dependencies..."
 pip install -q -r requirements.txt
 
 if [ $? -eq 0 ]; then
-    echo "✓ Dependencies installed"
+    echo "[OK] Dependencies installed"
 else
-    echo "✗ Failed to install dependencies"
+    echo "[FAIL] Failed to install dependencies"
     exit 1
 fi
 

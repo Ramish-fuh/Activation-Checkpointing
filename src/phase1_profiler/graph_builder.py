@@ -5,7 +5,7 @@ Graph Builder: Constructs computational graph from PyTorch execution.
 import torch
 from typing import Dict, List, Set, Optional, Tuple
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 @dataclass
@@ -128,9 +128,46 @@ class ComputationGraph:
             self.tensors[tensor_id].producer_node = from_node
     
     def get_topological_order(self) -> List[int]:
-        """Return nodes in topological order."""
-        # For now, return execution order (which should be topological)
-        return self.execution_order
+        """Return nodes in topological order using Kahn's algorithm."""
+        return self.compute_topological_order()
+    
+    def compute_topological_order(self) -> List[int]:
+        """Compute topological order using Kahn's algorithm."""
+        # Build in-degree map and adjacency list
+        in_degree = {node_id: 0 for node_id in self.nodes.keys()}
+        adj_list = {node_id: [] for node_id in self.nodes.keys()}
+        
+        # Build graph from tensor dependencies
+        for tensor_id, tensor_info in self.tensors.items():
+            producer = tensor_info.producer_node
+            consumers = tensor_info.consumer_nodes
+            
+            if producer is not None:
+                for consumer in consumers:
+                    if consumer in adj_list and producer in adj_list:
+                        adj_list[producer].append(consumer)
+                        in_degree[consumer] += 1
+        
+        # Start with nodes that have no dependencies
+        queue = deque([node_id for node_id, degree in in_degree.items() if degree == 0])
+        topo_order = []
+        
+        while queue:
+            node_id = queue.popleft()
+            topo_order.append(node_id)
+            
+            # Reduce in-degree for neighbors
+            for neighbor in adj_list[node_id]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        
+        # If we couldn't order all nodes (cycle detected), return execution order
+        if len(topo_order) != len(self.nodes):
+            print("Warning: Could not compute complete topological order, using execution order")
+            return self.execution_order
+        
+        return topo_order
     
     def get_activations(self) -> List[int]:
         """Get all activation tensor IDs."""
