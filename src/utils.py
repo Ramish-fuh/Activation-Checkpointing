@@ -3,6 +3,25 @@ import torch
 from torch._decomp.decompositions import native_layer_norm_backward
 aten = torch.ops.aten  # pyre-ignore
 
+
+def get_device() -> torch.device:
+    """Return the best available device: cuda > mps > cpu."""
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def get_optimizer_kwargs() -> dict:
+    """Return optimizer kwargs appropriate for the current device."""
+    if torch.cuda.is_available():
+        return {"foreach": True, "fused": True, "capturable": True}
+    # foreach=True uses multi-tensor ops (works on CPU/MPS).
+    # capturable=True is NOT included here because it requires CUDA at runtime.
+    # The graph tracer enables it during make_fx tracing where it's needed.
+    return {"foreach": True}
+
 def _foreach_add_decomp(self, other, alpha=1):
     self_updated = aten._foreach_add.List(self, other, alpha=alpha)
     for s, s_u in zip(self, self_updated):

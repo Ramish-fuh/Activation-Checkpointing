@@ -244,12 +244,29 @@ def _compile(func: Callable, *args: Any, **kwargs: Any):
     kwargs = pytree.tree_map_only(torch.Tensor, _get_fake_args, kwargs)
 
     with _enable_compile(), torch.autograd.detect_anomaly(check_nan=False):
+        # On non-CUDA devices, temporarily enable capturable=True for tracing.
+        # This is needed because make_fx tracing can't handle the scalar
+        # arithmetic in Adam's non-capturable path. The device assertion for
+        # capturable is skipped because _enable_compile() makes
+        # is_compiling() return True (see PyTorch adam.py).
+        _restore_capturable = False
+        if opt is not None and not torch.cuda.is_available():
+            opt.defaults['capturable'] = True
+            for group in opt.param_groups:
+                group['capturable'] = True
+            _restore_capturable = True
+
         gm = make_fx(
             partial(stateless_func, func),
             tracing_mode=tracing_mode,
             decomposition_table=SPMD_DECOMP_TABLE,
             _allow_non_fake_inputs=False,
         )(params, buffers, named_states, args, kwargs)
+
+        if _restore_capturable:
+            opt.defaults['capturable'] = False
+            for group in opt.param_groups:
+                group['capturable'] = False
 
     params_and_buffers: Dict[str, Union[torch.Tensor, nn.Parameter]] = {
         **params,

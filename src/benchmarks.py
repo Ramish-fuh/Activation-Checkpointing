@@ -13,6 +13,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torchvision.models import resnet18, resnet50
 from graph_prof import GraphProfiler
 from graph_tracer import SEPFunction, compile
+from utils import get_device, get_optimizer_kwargs
 
 
 model_names: List[str] = [
@@ -31,7 +32,7 @@ model_batch_sizes: Dict[str, int] = {
 class Experiment:
     def __init__(self, model_name: str, batch_size: int, extra_args=[]):
         assert model_name in model_names, f"Model {model_name} not found in model names {model_names}"
-        dev = torch.device("cuda")
+        dev = get_device()
         self.model_name = model_name
         self.batch_size = batch_size
 
@@ -62,7 +63,7 @@ class Experiment:
                 optim.zero_grad()
 
             self.train_step = transformer_train_step
-            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, fused=True, capturable=True)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, **get_optimizer_kwargs())
 
         elif self.model_name in ["Resnet18", "Resnet50"]:
             inp = torch.randn(self.batch_size, 3, 224, 224, device=dev)
@@ -81,7 +82,7 @@ class Experiment:
                 optim.step()
                 optim.zero_grad()
 
-            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, fused=True, capturable=True)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, **get_optimizer_kwargs())
             self.train_step = resnet_train_step
 
     def loss_fn(self, logits: torch.Tensor, targets: torch.Tensor):

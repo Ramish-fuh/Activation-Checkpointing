@@ -5,6 +5,7 @@ from typing import Dict
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
 from graph_tracer import SEPFunction
+from utils import get_device
 
 
 # We define a custom function that takes in two weight matrices that require
@@ -122,9 +123,10 @@ def activation_checkpointing(gm: fx.GraphModule) -> fx.GraphModule:
 
 if __name__ == "__main__":
     # Create two weight matrices that require gradients and one input data matrix
-    w1 = torch.randn(1024, 1024, device="cuda", requires_grad=True)
-    w2 = torch.randn(2048, 512, device="cuda", requires_grad=True)
-    x = torch.randn(1024, 2048, device="cuda")
+    _device = get_device()
+    w1 = torch.randn(1024, 1024, device=_device, requires_grad=True)
+    w2 = torch.randn(2048, 512, device=_device, requires_grad=True)
+    x = torch.randn(1024, 2048, device=_device)
 
     # Create a graph module by tracing the the custom function with the given inputs
     graph_module = make_fx(custom_fn)(w1, w2, x)

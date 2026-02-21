@@ -90,8 +90,10 @@ class GraphProfiler(fx.Interpreter):
 
         # you can start measuring the run-time of a node here
         result = super().run_node(n)
-        # you can end measuring the run-time of a node here HINT: Use
-        # torch.cuda.Events for doing time measurements of operations.
+        # you can end measuring the run-time of a node here HINT:
+        # For CUDA: use torch.cuda.Event(enable_timing=True) for GPU timing.
+        # For MPS: call torch.mps.synchronize() then use time.perf_counter().
+        # For CPU: use time.perf_counter() directly.
 
         # If you are in the forward pass region and if the current node 'n' is
         # the last user of a feature map 'x', then it should be swapped out to
