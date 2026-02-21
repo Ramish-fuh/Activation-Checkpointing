@@ -25,3 +25,9 @@ Pytorch
 Important:
 	•	Only works for functions without in-place ops
 	•	Doubles compute for that region
+
+
+
+    Find why
+
+    1. Resnet50 shows ACT: 0 B at peak: That's because at batch_size=4 the parameter+gradient+optimizer state memory (97.5 + 97.5 + 585 = 780 MB) dominates, and the peak step lands where no activations are alive. 
