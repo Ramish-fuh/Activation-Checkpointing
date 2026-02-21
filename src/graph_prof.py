@@ -382,19 +382,48 @@ class GraphProfiler(fx.Interpreter):
         A tensor is alive from its production until its last consumer finishes.
         Returns (peak_total_bytes, {NodeType: bytes_at_peak_step}).
         """
+        # Identify "decomposable" parents: nodes whose ALL users are getitem.
+        # For these, we skip the parent and instead count each getitem child
+        # individually so that each component gets its correct NodeType
+        # (e.g. GRAD for gradient components vs OTHER for the parent tuple).
+        decomposed_parents: Set[fx.Node] = set()
+        for node in self.node_list:
+            if (
+                node.users
+                and all(u.target is operator.getitem for u in node.users)
+            ):
+                decomposed_parents.add(node)
+
         # Build alive intervals: node -> (born_idx, dies_idx)
-        # Skip getitem nodes — they are references into a parent tuple/list
-        # whose memory is already counted under the parent node.
+        # Parameters and gradients are treated as persistent — once allocated
+        # they reside in memory throughout the iteration (per project spec).
+        last_step = len(self.node_list) - 1
         alive_range: Dict[fx.Node, Tuple[int, int]] = {}
         for node in self.node_list:
             mem = self.node_mem_bytes.get(node.name, 0)
-            if mem == 0 or node.target is operator.getitem:
+            if mem == 0:
                 continue
-            born = self.node_index[node]
-            dies = max(
-                (self.node_index[u] for u in node.users),
-                default=born,
-            )
+            # Skip decomposed parents — memory attributed to children
+            if node in decomposed_parents:
+                continue
+            # Skip getitem whose parent is NOT decomposed (rare edge case)
+            if node.target is operator.getitem:
+                parent = node.args[0]
+                if not isinstance(parent, fx.Node) or parent not in decomposed_parents:
+                    continue
+            nt = self.node_type.get(node, NodeType.OTHER)
+            # Params and grads persist for the entire iteration:
+            # param buffers + grad buffers are allocated once and reside in
+            # memory throughout (see project spec). Set born=0, dies=last.
+            if nt in (NodeType.PARAM, NodeType.GRAD):
+                born = 0
+                dies = last_step
+            else:
+                born = self.node_index[node]
+                dies = max(
+                    (self.node_index[u] for u in node.users),
+                    default=born,
+                )
             alive_range[node] = (born, dies)
 
         peak_mem = 0
