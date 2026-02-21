@@ -1,3 +1,0 @@
-"""
-Model definitions and wrappers.
-"""
