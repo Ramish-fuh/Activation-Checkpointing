@@ -13,3 +13,15 @@ More Exploration:
 	•	Break down how to profile GPU memory properly
 	•	Walk through how to modify PyTorch graph
 	•	Or analyze what kind of AC strategy would score highest
+
+
+Pytorch
+	1.	Runs forward normally
+	2.	Discards intermediate activations
+	3.	During backward:
+	•	Re-runs forward of that block
+	•	Then computes gradients
+
+Important:
+	•	Only works for functions without in-place ops
+	•	Doubles compute for that region
