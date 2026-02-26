@@ -1,11 +1,9 @@
 import operator
-import time
 from enum import Enum
 from typing import Dict, Any, List, Set, Optional, Tuple
 
 import torch
 import torch.fx as fx
-from utils import get_device
 
 
 class OP(str, Enum):
@@ -77,8 +75,8 @@ class GraphProfiler(fx.Interpreter):
 
 
 
-        self.device = get_device()
-        self.device_type = self.device.type
+        self.device = torch.device("cuda")
+        self.device_type = "cuda"
 
         # ===== STATIC ANALYSIS =====
 
@@ -267,28 +265,18 @@ class GraphProfiler(fx.Interpreter):
 
 
         # ----- timing start -----
-        if self.device_type == "cuda":
-            start_evt = torch.cuda.Event(enable_timing=True)
-            end_evt = torch.cuda.Event(enable_timing=True)
-            start_evt.record()
-        else:
-            if self.device_type == "mps":
-                torch.mps.synchronize()
-            t0 = time.perf_counter()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
 
         result = super().run_node(n)
           # you can end measuring the run-time of a node here HINT:
         # For CUDA: use torch.cuda.Event(enable_timing=True) for GPU timing.
 
         # ----- timing end -----
-        if self.device_type == "cuda":
-            end_evt.record()
-            torch.cuda.synchronize()
-            elapsed_ms = start_evt.elapsed_time(end_evt)
-        else:
-            if self.device_type == "mps":
-                torch.mps.synchronize()
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        end_evt.record()
+        torch.cuda.synchronize()
+        elapsed_ms = start_evt.elapsed_time(end_evt)
 
         self.node_runtimes[n.name].append(elapsed_ms)
 
