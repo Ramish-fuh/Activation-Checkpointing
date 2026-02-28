@@ -111,13 +111,20 @@ class Experiment:
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
             #  plot the peak memory breakdown
-            import os
-            plots_dir = os.path.join(os.path.dirname(__file__), '..', 'plots')
+            import os, traceback
+            plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'plots')
             os.makedirs(plots_dir, exist_ok=True)
-            graph_profiler.plot_peak_memory_breakdown(
-                title=f"{self.model_name} (bs={self.batch_size})",
-                save_path=os.path.join(plots_dir, f"peak_memory_breakdown_{self.model_name}_bs{self.batch_size}.png"),
-            )
+            save_path = os.path.join(plots_dir, f"peak_memory_breakdown_{self.model_name}_bs{self.batch_size}.png")
+            print(f"\n[PLOT] Attempting to save plot to: {save_path}")
+            try:
+                graph_profiler.plot_peak_memory_breakdown(
+                    title=f"{self.model_name} (bs={self.batch_size})",
+                    save_path=save_path,
+                )
+                print(f"[PLOT] File exists: {os.path.exists(save_path)}, size: {os.path.getsize(save_path) if os.path.exists(save_path) else 0} bytes")
+            except Exception as e:
+                print(f"[PLOT] ERROR generating plot: {e}")
+                traceback.print_exc()
 
         return gm
 
