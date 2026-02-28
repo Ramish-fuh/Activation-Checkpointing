@@ -110,7 +110,6 @@ class Experiment:
                 graph_profiler.run(*args)
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
-
             #  plot the peak memory breakdown
             import os
             plots_dir = os.path.join(os.path.dirname(__file__), '..', 'plots')

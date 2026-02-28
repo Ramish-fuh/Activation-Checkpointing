@@ -26,6 +26,9 @@ venv/
 env/
 ENV/
 
+# Plots
+plots/
+
 # PyTorch
 *.pth
 *.pt

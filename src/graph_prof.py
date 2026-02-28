@@ -434,6 +434,47 @@ class GraphProfiler(fx.Interpreter):
 
     # ----- helpers -----
 
+    def plot_peak_memory_breakdown(self, title: str = "", save_path: Optional[str] = None) -> None:
+        """Generate a bar chart of peak memory breakdown by NodeType."""
+        import matplotlib
+        matplotlib.use('Agg')  # non-interactive backend for scripts
+        import matplotlib.pyplot as plt
+
+        peak_mem, breakdown = self.compute_peak_memory()
+
+        categories = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OTHER]
+        labels = [nt.name for nt in categories]
+        sizes_mb = [breakdown.get(nt, 0) / 1024 ** 2 for nt in categories]
+        colors = ['#4C72B0', '#DD8452', '#55A868', '#C44E52']
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Bar chart
+        bars = ax1.bar(labels, sizes_mb, color=colors, edgecolor='black')
+        for bar, val in zip(bars, sizes_mb):
+            if val > 0:
+                ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                         f'{val:.1f}', ha='center', va='bottom', fontsize=10)
+        ax1.set_ylabel('Memory (MB)')
+        ax1.set_title(f'Peak Memory Breakdown{" — " + title if title else ""}')
+        ax1.grid(axis='y', alpha=0.3)
+
+        # Pie chart
+        nonzero = [(l, s, c) for l, s, c in zip(labels, sizes_mb, colors) if s > 0]
+        if nonzero:
+            pie_labels, pie_sizes, pie_colors = zip(*nonzero)
+            ax2.pie(pie_sizes, labels=pie_labels, colors=pie_colors, autopct='%1.1f%%',
+                    startangle=90, textprops={'fontsize': 10})
+            ax2.set_title(f'Peak: {peak_mem / 1024 ** 2:.1f} MB')
+
+        plt.tight_layout()
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Saved plot: {save_path}")
+        plt.close(fig)
+
     @staticmethod
     def _tensor_memory(val: Any) -> int:
         """Return total bytes for a tensor or collection of tensors."""
