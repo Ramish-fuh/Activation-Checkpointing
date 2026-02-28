@@ -436,9 +436,19 @@ class GraphProfiler(fx.Interpreter):
 
     def plot_peak_memory_breakdown(self, title: str = "", save_path: Optional[str] = None) -> None:
         """Generate a bar chart of peak memory breakdown by NodeType."""
-        import matplotlib
-        matplotlib.use('Agg')  # non-interactive backend for scripts
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("WARNING: matplotlib not installed, skipping plot")
+            return
+
+        # Force non-interactive backend
+        backend = matplotlib.get_backend()
+        if backend != 'agg':
+            matplotlib.use('Agg', force=True)
+            import importlib
+            importlib.reload(plt)
 
         peak_mem, breakdown = self.compute_peak_memory()
 
@@ -470,9 +480,11 @@ class GraphProfiler(fx.Interpreter):
         plt.tight_layout()
         if save_path:
             import os
-            os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
             fig.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved plot: {save_path}")
+            print(f"Saved plot: {os.path.abspath(save_path)}")
+        else:
+            print("WARNING: no save_path provided, plot not saved")
         plt.close(fig)
 
     @staticmethod
