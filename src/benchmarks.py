@@ -111,6 +111,15 @@ class Experiment:
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
 
+            #  plot the peak memory breakdown
+            import os
+            plots_dir = os.path.join(os.path.dirname(__file__), '..', 'plots')
+            os.makedirs(plots_dir, exist_ok=True)
+            graph_profiler.plot_peak_memory_breakdown(
+                title=f"{self.model_name} (bs={self.batch_size})",
+                save_path=os.path.join(plots_dir, f"peak_memory_breakdown_{self.model_name}_bs{self.batch_size}.png"),
+            )
+
         return gm
 
     def run(self):
@@ -119,7 +128,13 @@ class Experiment:
 
 
 if __name__ == "__main__":
-    exp = Experiment(model_names[1], model_batch_sizes[model_names[1]])
+    import sys
+    # Usage: python benchmarks.py [model_name] [batch_size]
+    # Defaults: Resnet18, default batch size from model_batch_sizes
+    name = sys.argv[1] if len(sys.argv) > 1 else model_names[1]
+    bs = int(sys.argv[2]) if len(sys.argv) > 2 else model_batch_sizes[name]
+    print(f"Model: {name}, batch_size={bs}\n")
+    exp = Experiment(name, bs)
     exp.init_opt_states()
     compiled_fn = compile(exp.train_step, exp.graph_transformation)
     compiled_fn(exp.model, exp.optimizer, exp.example_inputs)
