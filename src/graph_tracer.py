@@ -1,14 +1,10 @@
 # ============================================================================
 # graph_tracer.py
 #
-# This module handles tracing a PyTorch training step (forward + backward +
-# optimizer) into a single torch.fx GraphModule.  Key responsibilities:
-#   1. Define sep / sep_backward marker ops that delimit the forward and
-#      backward passes inside the traced graph.
-#   2. Provide a compile() decorator that traces an entire train_step
-#      function (including parameter updates) into an fx graph, applies
-#      user-supplied graph transformations (e.g. activation checkpointing),
-#      and then replays the graph on subsequent iterations.
+# Traces a full PyTorch training step (forward + backward + optimizer)
+# into a single torch.fx GraphModule via make_fx.  Defines sep /
+# sep_backward marker ops for region boundary detection and provides
+# the compile() decorator for one-shot tracing + graph replay.
 # ============================================================================
 
 from contextlib import contextmanager, nullcontext
@@ -36,12 +32,10 @@ from torch.utils.hooks import RemovableHandle
 
 
 # ---------------------------------------------------------------------------
-# Separator ops: identity functions registered as custom torch ops.
-# sep(x)          – inserted at the START of the forward pass.
-# sep_backward(x) – inserted at the START of the backward pass.
-# They act as no-ops at runtime but appear as distinct nodes in the fx graph,
-# letting the profiler (graph_prof.py) locate the boundary between the
-# forward pass, backward pass, and optimizer step.
+# Separator ops — identity functions registered as custom torch library ops.
+# sep(x) marks the start of the forward pass; sep_backward(x) marks the
+# start of the backward pass.  They are no-ops at runtime but appear as
+# named nodes in the fx graph for region boundary detection.
 # ---------------------------------------------------------------------------
 
 def sep(x: torch.Tensor) -> torch.Tensor:
@@ -65,9 +59,7 @@ separator_lib.impl("sep_backward", sep_backward, "CompositeExplicitAutograd")
 
 # ---------------------------------------------------------------------------
 # DTensor sharding propagation rules for the separator ops.
-# When running under tensor parallelism (DTensor), the framework needs to
-# know how each op transforms sharding specs.  Since sep / sep_backward are
-# pure identities, the output sharding is always the same as the input.
+# Both are identities, so the output sharding always matches the input.
 # ---------------------------------------------------------------------------
 
 def _identity_prop_rule(op_schema: OpSchema) -> OutputSharding:
@@ -108,11 +100,8 @@ class SEPFunction(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
-# Dummy tag_grad op: an identity op attached via backward hooks to every
-# parameter gradient.  During tracing it produces visible graph nodes that
-# label which tensors are gradients.  After tracing, these nodes are
-# cleaned up (erased) in _compile().  This is needed so the profiler /
-# SPMD expansion can distinguish gradient tensors from activations.
+# Dummy tag_grad op — attached via backward hooks to label gradient
+# tensors during tracing.  Cleaned up (erased) in _compile() afterward.
 # ---------------------------------------------------------------------------
 _spmd_lib_def = torch.library.Library("dummy", "DEF")
 _spmd_lib_def.define("tag_grad(Tensor self) -> Tensor")

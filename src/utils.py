@@ -1,8 +1,14 @@
+# ============================================================================
+# utils.py
+#
+# Decomposition table (SPMD_DECOMP_TABLE) that rewrites fused / foreach
+# ATen ops into per-tensor equivalents so make_fx can trace through them.
+# ============================================================================
+
 from functools import partial
 import torch
 from torch._decomp.decompositions import native_layer_norm_backward
 aten = torch.ops.aten  # pyre-ignore
-
 
 def _foreach_add_decomp(self, other, alpha=1):
     self_updated = aten._foreach_add.List(self, other, alpha=alpha)

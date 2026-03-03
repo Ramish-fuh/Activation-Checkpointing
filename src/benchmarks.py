@@ -1,3 +1,14 @@
+# ============================================================================
+# benchmarks.py
+#
+# Experiment harness for tracing and profiling a single training step.
+# Supports Transformer, Resnet18, and Resnet50 architectures.  The
+# graph_transformation callback runs the GraphProfiler and saves a
+# peak-memory breakdown plot after the first compiled iteration.
+# ============================================================================
+
+import os
+import sys
 import importlib
 from typing import Any, Dict, List
 
@@ -29,7 +40,13 @@ model_batch_sizes: Dict[str, int] = {
 
 
 class Experiment:
+    """Encapsulates model creation, training-step definition, and the
+    graph-transformation callback used by compile() to profile a single
+    training iteration."""
+
     def __init__(self, model_name: str, batch_size: int, extra_args=[]):
+        """Build the model, example inputs, optimizer, and training-step
+        closure for the requested architecture."""
         assert model_name in model_names, f"Model {model_name} not found in model names {model_names}"
         dev = torch.device("cuda")
         self.model_name = model_name
@@ -85,11 +102,14 @@ class Experiment:
             self.train_step = resnet_train_step
 
     def loss_fn(self, logits: torch.Tensor, targets: torch.Tensor):
+        """Cross-entropy loss, flattened over all sequence positions."""
         return F.cross_entropy(
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
         )
 
     def init_opt_states(self):
+        """Run one dummy optimizer step so Adam's momentum/variance buffers
+        are allocated before tracing (make_fx requires them to exist)."""
         for param in self.model.parameters():
             if param.requires_grad:
                 param.grad = torch.rand_like(param)
@@ -97,6 +117,13 @@ class Experiment:
         self.optimizer.zero_grad()
 
     def graph_transformation(self, gm: fx.GraphModule, args: Any) -> fx.GraphModule:
+        """Profile the traced graph and save a peak-memory breakdown plot.
+
+        Called once by compile() after the first tracing iteration.  Runs
+        warm-up iterations to stabilise CUDA caches, then profiles several
+        iterations, prints per-node stats, and writes a bar chart to the
+        ``plots/`` directory.
+        """
         print(gm.graph.print_tabular())
         warm_up_iters, profile_iters = 2, 3
         graph_profiler = GraphProfiler(gm)
@@ -110,33 +137,35 @@ class Experiment:
                 graph_profiler.run(*args)
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
-            #  plot the peak memory breakdown
-            import os, traceback
-            plots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'plots')
+
+            # Save peak-memory breakdown plot to ../plots/
+            plots_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'plots'
+            )
             os.makedirs(plots_dir, exist_ok=True)
-            save_path = os.path.join(plots_dir, f"peak_memory_breakdown_{self.model_name}_bs{self.batch_size}.png")
-            print(f"\n[PLOT] Attempting to save plot to: {save_path}")
+            save_path = os.path.join(
+                plots_dir,
+                f"peak_memory_breakdown_{self.model_name}_bs{self.batch_size}.png",
+            )
             try:
                 graph_profiler.plot_peak_memory_breakdown(
                     title=f"{self.model_name} (bs={self.batch_size})",
                     save_path=save_path,
                 )
-                print(f"[PLOT] File exists: {os.path.exists(save_path)}, size: {os.path.getsize(save_path) if os.path.exists(save_path) else 0} bytes")
             except Exception as e:
-                print(f"[PLOT] ERROR generating plot: {e}")
-                traceback.print_exc()
+                print(f"Warning: could not save plot: {e}")
 
         return gm
 
     def run(self):
+        """Execute a single (non-compiled) training step for sanity checking."""
         self.train_step(self.model, self.optimizer, self.example_inputs)
         print("Successful.")
 
 
 if __name__ == "__main__":
-    import sys
     # Usage: python benchmarks.py [model_name] [batch_size]
-    # Defaults: Resnet18, default batch size from model_batch_sizes
+    # Defaults: Resnet18 with its standard batch size.
     name = sys.argv[1] if len(sys.argv) > 1 else model_names[1]
     bs = int(sys.argv[2]) if len(sys.argv) > 2 else model_batch_sizes[name]
     print(f"Model: {name}, batch_size={bs}\n")
