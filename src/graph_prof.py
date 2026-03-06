@@ -224,7 +224,10 @@ class GraphProfiler(fx.Interpreter):
                 self.node_region[node] = "backward"
 
     def _init_runtime_storage(self) -> None:
-        """Set up empty containers for profiling data."""
+        """Set up empty containers for profiling data per-iteration. 
+        These will be populated in ``run_node`` and aggregated in
+        ``aggregate_stats
+        """
         self.node_runtimes:    Dict[str, List[float]] = {n.name: [] for n in self.node_list}
         self.node_mem_bytes:   Dict[str, int]         = {}
         self.node_avg_runtime: Dict[str, float]       = {}
@@ -236,11 +239,14 @@ class GraphProfiler(fx.Interpreter):
     def _identify_params_and_grads(self) -> None:
         """Populate ``param_nodes``, ``grad_nodes``, ``optimizer_state_nodes``.
 
-        Strategy 1 -- _fused_adam (CUDA): single fused op whose args
+        Option 1: using Cuda on Nvidia gpus
+
+        fused_adam (CUDA): single fused op whose args
         directly list params, grads, and optimizer states.
 
-        Strategy 2 -- _foreach heuristic (CPU / older PyTorch): infer
-        from ``copy_`` targets and ``_foreach_addcmul`` patterns.
+        Option 2 -- _foreach heuristic (CPU / older PyTorch): (local testing fallback)
+
+        infer from ``copy_`` targets and ``_foreach_addcmul`` patterns.
         """
         self.param_nodes:           Set[fx.Node] = set()
         self.grad_nodes:            Set[fx.Node] = set()
