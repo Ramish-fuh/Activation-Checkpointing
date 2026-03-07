@@ -239,21 +239,17 @@ class GraphProfiler(fx.Interpreter):
     def _identify_params_and_grads(self) -> None:
         """Populate ``param_nodes``, ``grad_nodes``, ``optimizer_state_nodes``.
 
-        Option 1: using Cuda on Nvidia gpus
-
-        fused_adam (CUDA): single fused op whose args
-        directly list params, grads, and optimizer states.
-
-        Option 2 -- _foreach heuristic (CPU / older PyTorch): (local testing fallback)
-
-        infer from ``copy_`` targets and ``_foreach_addcmul`` patterns.
+        Fused Adam (CUDA) is required in this setup. Its args directly list
+        params, grads, and optimizer states.
         """
         self.param_nodes:           Set[fx.Node] = set()
         self.grad_nodes:            Set[fx.Node] = set()
         self.optimizer_state_nodes: Set[fx.Node] = set()
 
         if not self._try_fused_adam():
-            self._try_foreach_heuristic()
+            raise RuntimeError(
+                "Expected aten._fused_adam in FX graph, but it was not found."
+            )
 
     def _try_fused_adam(self) -> bool:
         """Read params / grads / states from ``_fused_adam`` args.
@@ -272,54 +268,6 @@ class GraphProfiler(fx.Interpreter):
             return True
 
         return False
-
-    def _try_foreach_heuristic(self) -> None:
-        """Fallback: identify from ``copy_`` and ``_foreach_addcmul`` patterns.
-
-        copy_ dest with forward users     -> param
-        copy_ dest without forward users  -> optimizer state
-        _foreach_addcmul.Scalar args[1]   -> grads
-        """
-        placeholders = {n for n in self.node_list if n.op == OP.PLACEHOLDER}
-        copy_targets = self._find_copy_targets(placeholders)
-
-        for ph in placeholders:
-            if ph not in copy_targets:
-                continue
-            if self._has_forward_users(ph):
-                self.param_nodes.add(ph)
-            else:
-                self.optimizer_state_nodes.add(ph)
-
-        self._find_grads_from_foreach(placeholders)
-
-    def _find_copy_targets(self, placeholders: Set[fx.Node]) -> Set[fx.Node]:
-        """Return placeholders that are the dest of in-place ``copy_``."""
-        targets: Set[fx.Node] = set()
-        for node in self.node_list:
-            if node.target is torch.ops.aten.copy_.default:
-                dst = node.args[0]
-                if isinstance(dst, fx.Node) and dst in placeholders:
-                    targets.add(dst)
-        return targets
-
-    def _has_forward_users(self, node: fx.Node) -> bool:
-        """True if *node* has at least one consumer in the forward region."""
-        return any(
-            self.node_index.get(u, self.sep_idx) < self.sep_idx
-            for u in node.users if u.op != OP.OUTPUT
-        )
-
-    def _find_grads_from_foreach(self, placeholders: Set[fx.Node]) -> None:
-        """Identify grads from ``_foreach_addcmul.Scalar`` (Adam 2nd-moment)."""
-        for node in self.node_list:
-            if node.target is torch.ops.aten._foreach_addcmul.Scalar:
-                grad_list = node.args[1]
-                if isinstance(grad_list, (list, tuple)):
-                    for g in grad_list:
-                        if isinstance(g, fx.Node) and g not in placeholders:
-                            self.grad_nodes.add(g)
-                break
 
     # ------------------------------------------------------------------
     # Node Classification
