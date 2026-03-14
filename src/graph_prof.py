@@ -461,7 +461,12 @@ class GraphProfiler(fx.Interpreter):
         self,
         alive: Dict[fx.Node, Tuple[int, int]],
     ) -> Tuple[int, Dict[NodeType, int]]:
-        """Walk every step; return ``(peak_bytes, per-type breakdown at peak)``."""
+        """Sweep the node timeline to find peak alive memory.
+
+        At each step, sum bytes for nodes whose lifetime window covers that
+        step and accumulate bytes by ``NodeType``. Returns the maximum total
+        bytes and the per-type breakdown at that peak step.
+        """
         peak_bytes = 0
         peak_bd:   Dict[NodeType, int] = {}
 
