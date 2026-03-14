@@ -322,7 +322,11 @@ class GraphProfiler(fx.Interpreter):
         )
 
     def _register_activation(self, node: fx.Node) -> None:
-        """Label *node* as ACT and record its liveness endpoints."""
+        """Label *node* as ACT and record where its lifetime crosses regions.
+
+        Saves the last forward consumer and first backward consumer,
+        which are the key endpoints for activation liveness.
+        """
         self.node_type[node] = NodeType.ACT
         self.intermediate_nodes.append(node)
 
