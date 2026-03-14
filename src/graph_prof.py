@@ -420,10 +420,18 @@ class GraphProfiler(fx.Interpreter):
         self,
         decomposed: Set[fx.Node],
     ) -> Dict[fx.Node, Tuple[int, int]]:
-        """``{node: (born, dies)}`` for every tensor-producing node.
+        """Build per-node lifetime windows as ``{node: (born_idx, dies_idx)}``.
 
-        PARAMs / GRADs persist the full iteration.  Others: born = production,
-        dies = last consumer.  Decomposed parents are skipped.
+        A node is considered alive for every step ``i`` where
+        ``born_idx <= i <= dies_idx``.
+
+        Rules:
+        - Skip nodes with 0 measured bytes.
+        - Skip tuple/container parents listed in ``decomposed``.
+        - PARAM and GRAD nodes live for the full iteration: ``(0, last_idx)``.
+        - Other tensor nodes live from their own index to their last consumer.
+        - ``getitem`` nodes are counted only when they extract from a decomposed
+            parent (to avoid counting unrelated edge cases).
         """
         last = len(self.node_list) - 1
         ranges: Dict[fx.Node, Tuple[int, int]] = {}
