@@ -221,7 +221,13 @@ class GraphProfiler(fx.Interpreter):
         self.sep_bw_idx: int = self.node_index[self.sep_backward_node]
 
     def _label_regions(self) -> None:
-        """Tag every node: ``forward`` | ``loss`` | ``backward``."""
+        """Tag every node as 'forward', 'loss', or 'backward'.
+
+        Uses the two separator indices as fences:
+          idx <= sep_idx          -> forward
+          sep_idx < idx < sep_bw_idx  -> loss
+          idx >= sep_bw_idx       -> backward
+        """
         self.node_region: Dict[fx.Node, str] = {}
         for idx, node in enumerate(self.node_list):
             if idx <= self.sep_idx:
@@ -335,6 +341,7 @@ class GraphProfiler(fx.Interpreter):
     # ------------------------------------------------------------------
 
     def _print_classification_summary(self) -> None:
+        """Print a count of nodes per NodeType (PARAM / ACT / GRAD / OTHER)."""
         counts: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
         for nt in self.node_type.values():
             counts[nt] += 1
@@ -343,6 +350,7 @@ class GraphProfiler(fx.Interpreter):
             print(f"  {nt.name:8s}: {counts[nt]} nodes")
 
     def _print_activation_table(self) -> None:
+        """Print each intermediate activation with its memory size and liveness endpoints."""
         n = len(self.intermediate_nodes)
         print(f"\n--- Intermediate Activations ({n}) ---")
         print(f"  {'Name':30s} | {'Memory':>10s} | {'Last FW Use':20s} | {'First BW Use':20s}")
@@ -358,6 +366,7 @@ class GraphProfiler(fx.Interpreter):
             )
 
     def _print_per_node_table(self) -> None:
+        """Print type, region, average runtime, and memory for every non-I/O node."""
         print("\n--- Per-Node Profiling ---")
         print(
             f"  {'Name':30s} | {'Type':6s} | {'Region':8s} | "
@@ -374,6 +383,7 @@ class GraphProfiler(fx.Interpreter):
             print(f"  {node.name:30s} | {nt:6s} | {region:8s} | {avg_t:10.4f} | {mem:>10s}")
 
     def _print_memory_summary(self) -> None:
+        """Print simulated peak memory broken down by NodeType."""
         peak, breakdown = self.compute_peak_memory()
         print("\n--- Memory Summary ---")
         for nt in (NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OTHER):
