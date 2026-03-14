@@ -409,8 +409,8 @@ class GraphProfiler(fx.Interpreter):
         return self._sweep_for_peak(alive)
 
     def _find_decomposed_parents(self) -> Set[fx.Node]:
-        """Nodes whose *only* consumers are ``getitem`` (e.g. ``_fused_adam``
-        returning a tuple).  Memory is attributed to children instead."""
+        """Find tuple/container nodes consumed only by ``getitem``; skip them so
+        memory is counted on the extracted child tensors, not twice."""
         return {
             n for n in self.node_list
             if n.users and all(u.target is operator.getitem for u in n.users)
