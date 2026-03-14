@@ -184,7 +184,15 @@ class GraphProfiler(fx.Interpreter):
     # ------------------------------------------------------------------
 
     def _build_node_index(self) -> None:
-        """Flatten the graph into an ordered list with O(1) index lookup."""
+        """Capture the FX graph's existing topological order into a list and index map.
+
+        Does not sort — fx.Graph.nodes is already in topological order.
+        node_index[node] gives each node an integer position, which every
+        later pass uses to answer positional questions:
+          - is this node before or after sep_backward?
+          - is a consumer in the forward or backward region?
+          - when is a tensor born and when is its last use?
+        """
         self.node_list: List[fx.Node] = list(self.module.graph.nodes)
         self.node_index: Dict[fx.Node, int] = {
             node: idx for idx, node in enumerate(self.node_list)
