@@ -38,3 +38,18 @@ Important:
 		 - `foreach=True` traces to `_foreach_*` ops
 		 - `fused=True` traces to `aten._fused_adam`
 		profiler currently expects `aten._fused_adam`, so the failure was caused by optimizer dispatch choice, not by missing GPU support.
+
+
+
+
+
+When testing with bert we will encounter parralle : execution which will require topological sorting: fix me then
+
+
+
+Clasificatioin of notes: from start to end : how fx works
+
+
+how adam fused put params and variables.
+
+why choose fx and why does the do and what functions does it have thae we need and explain how they work
