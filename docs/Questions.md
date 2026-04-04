@@ -53,3 +53,6 @@ Clasificatioin of notes: from start to end : how fx works
 how adam fused put params and variables.
 
 why choose fx and why does the do and what functions does it have thae we need and explain how they work
+
+
+why memory goes up doing weight updates
