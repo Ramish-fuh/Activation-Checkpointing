@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.fx as fx
-from typing import Dict
+from typing import Dict, List
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
 from graph_tracer import SEPFunction
+from mu_two_policy import CheckpointPlan
 
 
 # We define a custom function that takes in two weight matrices that require
@@ -51,6 +52,72 @@ def get_name_to_node_map(gm: fx.GraphModule) -> Dict[str, fx.Node]:
     for node in gm.graph.nodes:
         name_to_node[node.name] = node
     return name_to_node
+
+
+def apply_checkpoint_plan(gm: fx.GraphModule, plan: CheckpointPlan) -> fx.GraphModule:
+    """Apply a policy-generated checkpoint plan to the joint fwd+bwd graph.
+
+    The plan is expected to contain recompute targets, insertion points, and
+    boundary inputs for each target node.
+    """
+    name_to_node = get_name_to_node_map(gm)
+    graph_nodes = list(gm.graph.nodes)
+    graph_index = {node: idx for idx, node in enumerate(graph_nodes)}
+
+    ordered_targets: List[fx.Node] = sorted(
+        list(plan.recompute_nodes),
+        key=lambda n: graph_index.get(plan.first_backward_use.get(n, n), 10**9),
+    )
+
+    for target in ordered_targets:
+        target_name = target.name
+        if target_name not in name_to_node:
+            continue
+        if target not in plan.first_backward_use:
+            continue
+        if target not in plan.required_recompute_inputs:
+            continue
+
+        target_node = name_to_node[target_name]
+        first_back_access = name_to_node.get(plan.first_backward_use[target].name)
+        if first_back_access is None:
+            continue
+
+        required_inputs = []
+        for inp in plan.required_recompute_inputs[target]:
+            mapped = name_to_node.get(inp.name)
+            if mapped is None:
+                required_inputs = []
+                break
+            required_inputs.append(mapped)
+        if not required_inputs:
+            continue
+
+        recompute_subgraph = _extract_graph_with_inputs_outputs(
+            joint_graph=gm.graph,
+            inputs=required_inputs,
+            outputs=[target_node],
+        )
+
+        with gm.graph.inserting_before(first_back_access):
+            for n in recompute_subgraph.nodes:
+                if n.op == "placeholder" or n.op == "output":
+                    continue
+                new_node = gm.graph.node_copy(
+                    n, arg_transform=lambda arg: name_to_node[arg.name]
+                )
+                if n.name == target_name:
+                    replace_subsequent_uses_of(
+                        gm.graph,
+                        old_node=target_node,
+                        new_node=new_node,
+                    )
+                name_to_node[n.name] = new_node
+
+        gm.graph.lint()
+        gm.recompile()
+
+    return gm
 
 
 def activation_checkpointing(gm: fx.GraphModule) -> fx.GraphModule:
