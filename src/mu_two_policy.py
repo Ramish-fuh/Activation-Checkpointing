@@ -214,60 +214,6 @@ def _select_recompute_nodes(
     return decisions, selected_mem_bytes, selected_cost_ms
 
 
-def build_checkpoint_plan(
-    graph_profiler: Any,
-    config: Optional[PolicyConfig] = None,
-) -> CheckpointPlan:
-    """Build a conservative, mu-TWO-style checkpointing plan.
-
-    The policy prioritizes activations that save more memory per unit
-    recomputation cost and enforces legality constraints for Phase 3.
-    """
-    config = config or PolicyConfig()
-    _validate_profiler_contract(graph_profiler)
-
-    activations = list(graph_profiler.intermediate_nodes)
-    retained: Set[Any] = set(activations)
-    recompute: Set[Any] = set()
-    first_bw_use: Dict[Any, Any] = {}
-    required_inputs_map: Dict[Any, Set[Any]] = {}
-
-    estimated_peak_before, _ = graph_profiler.compute_peak_memory()
-    candidates = _collect_policy_candidates(graph_profiler, activations)
-
-    # Deterministic ordering: best score, then larger memory, then topological order.
-    candidates.sort(
-        key=lambda row: (
-            row[3],
-            row[1],
-            -graph_profiler.node_index[row[0]],
-        ),
-        reverse=True,
-    )
-    decisions, selected_mem_bytes, selected_cost_ms = _select_recompute_nodes(
-        candidates=candidates,
-        config=config,
-        estimated_peak_before=estimated_peak_before,
-        retained=retained,
-        recompute=recompute,
-        first_bw_use=first_bw_use,
-        required_inputs_map=required_inputs_map,
-    )
-
-    estimated_peak_after = max(0, estimated_peak_before - selected_mem_bytes)
-    return CheckpointPlan(
-        retained_nodes=retained,
-        recompute_nodes=recompute,
-        first_backward_use=first_bw_use,
-        required_recompute_inputs=required_inputs_map,
-        decisions=decisions,
-        estimated_memory_saved_bytes=selected_mem_bytes,
-        estimated_recompute_overhead_ms=selected_cost_ms,
-        estimated_peak_before_bytes=estimated_peak_before,
-        estimated_peak_after_bytes=estimated_peak_after,
-    )
-
-
 def _required_recompute_inputs(
     target_node: Any,
     graph_profiler: Any,
@@ -342,3 +288,57 @@ def _fmt_bytes(b: int) -> str:
         if b >= threshold:
             return f"{b / threshold:.1f} {unit}"
     return f"{b} B"
+
+
+def build_checkpoint_plan(
+    graph_profiler: Any,
+    config: Optional[PolicyConfig] = None,
+) -> CheckpointPlan:
+    """Build a conservative, mu-TWO-style checkpointing plan.
+
+    The policy prioritizes activations that save more memory per unit
+    recomputation cost and enforces legality constraints for Phase 3.
+    """
+    config = config or PolicyConfig()
+    _validate_profiler_contract(graph_profiler)
+
+    activations = list(graph_profiler.intermediate_nodes)
+    retained: Set[Any] = set(activations)
+    recompute: Set[Any] = set()
+    first_bw_use: Dict[Any, Any] = {}
+    required_inputs_map: Dict[Any, Set[Any]] = {}
+
+    estimated_peak_before, _ = graph_profiler.compute_peak_memory()
+    candidates = _collect_policy_candidates(graph_profiler, activations)
+
+    # Deterministic ordering: best score, then larger memory, then topological order.
+    candidates.sort(
+        key=lambda row: (
+            row[3],
+            row[1],
+            -graph_profiler.node_index[row[0]],
+        ),
+        reverse=True,
+    )
+    decisions, selected_mem_bytes, selected_cost_ms = _select_recompute_nodes(
+        candidates=candidates,
+        config=config,
+        estimated_peak_before=estimated_peak_before,
+        retained=retained,
+        recompute=recompute,
+        first_bw_use=first_bw_use,
+        required_inputs_map=required_inputs_map,
+    )
+
+    estimated_peak_after = max(0, estimated_peak_before - selected_mem_bytes)
+    return CheckpointPlan(
+        retained_nodes=retained,
+        recompute_nodes=recompute,
+        first_backward_use=first_bw_use,
+        required_recompute_inputs=required_inputs_map,
+        decisions=decisions,
+        estimated_memory_saved_bytes=selected_mem_bytes,
+        estimated_recompute_overhead_ms=selected_cost_ms,
+        estimated_peak_before_bytes=estimated_peak_before,
+        estimated_peak_after_bytes=estimated_peak_after,
+    )
