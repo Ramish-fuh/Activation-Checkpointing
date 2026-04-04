@@ -9,6 +9,7 @@
 
 import os
 import sys
+import json
 import importlib
 from typing import Any, Dict, List
 
@@ -23,6 +24,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     )
 from torchvision.models import resnet18, resnet50
 from graph_prof import GraphProfiler
+from mu_two_policy import build_checkpoint_plan, PolicyConfig
 from graph_tracer import SEPFunction, compile
 
 
@@ -137,12 +139,29 @@ class Experiment:
                 graph_profiler.run(*args)
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
+            # TODO:test a 100 MB peak-memory target.
+            # plan = build_checkpoint_plan(
+            #     graph_profiler,
+            #     PolicyConfig(target_peak_memory_bytes=100 * 1024 * 1024),
+            # )
+            plan = build_checkpoint_plan(graph_profiler, PolicyConfig())
+            plan.print_summary(top_k=12)
 
             # Save peak-memory breakdown plot to ../plots/
             plots_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), '..', 'plots'
             )
             os.makedirs(plots_dir, exist_ok=True)
+
+            # Save Phase 2 plan as a JSON artifact for reproducible analysis.
+            plan_path = os.path.join(
+                plots_dir,
+                f"checkpoint_plan_{self.model_name}_bs{self.batch_size}.json",
+            )
+            with open(plan_path, "w", encoding="utf-8") as f:
+                json.dump(plan.to_dict(), f, indent=2)
+            print(f"Saved plan: {os.path.abspath(plan_path)}")
+
             save_path = os.path.join(
                 plots_dir,
                 f"peak_memory_breakdown_{self.model_name}_bs{self.batch_size}.png",
