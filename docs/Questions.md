@@ -59,4 +59,4 @@ why memory goes up doing weight updates
 
 
 TODO:
-- Add the paper's active-swap branch to mu-TWO; the current code only selects recompute activations and does not implement the hybrid swap/recompute scheduler.
+- Finish paper-level μ-TWO fidelity: the scheduler now estimates recompute cost and supports a swap path, but it still needs the paper's exact swap-overhead model, iterative candidate updates, and memory-simulation-based validation.
