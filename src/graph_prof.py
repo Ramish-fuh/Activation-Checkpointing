@@ -538,31 +538,44 @@ class GraphProfiler(fx.Interpreter):
         peak_region = self.node_region.get(self.node_list[peak_step], "?") if peak_step >= 0 else "?"
         max_act_region = self.node_region.get(self.node_list[max_act_step], "?") if max_act_step >= 0 else "?"
 
-        print(f"  peak step: {peak_step}, region: {peak_region}, total: {self._fmt_bytes(peak_total)}")
+        # Forward-only peak
+        fw_peak_step, fw_peak_total, fw_peak_by_type = self._sweep_for_forward_peak(alive)
+        fw_peak_region = self.node_region.get(self.node_list[fw_peak_step], "?") if fw_peak_step >= 0 else "?"
+
+        print(f"  peak step (overall): {peak_step}, region: {peak_region}, total: {self._fmt_bytes(peak_total)}")
+        print(f"  peak step (forward only): {fw_peak_step}, region: {fw_peak_region}, total: {self._fmt_bytes(fw_peak_total)}")
         print(f"  peak ACT at any step: step {max_act_step}, region: {max_act_region}, ACT={self._fmt_bytes(max_act_bytes)}")
         print(
-            "  breakdown at peak: "
+            "  breakdown at overall peak: "
             f"PARAM={self._fmt_bytes(peak_by_type.get(NodeType.PARAM, 0))}, "
             f"ACT={self._fmt_bytes(peak_by_type.get(NodeType.ACT, 0))}, "
             f"GRAD={self._fmt_bytes(peak_by_type.get(NodeType.GRAD, 0))}, "
             f"OPT={self._fmt_bytes(peak_by_type.get(NodeType.OPT, 0))}, "
             f"OTHER={self._fmt_bytes(peak_by_type.get(NodeType.OTHER, 0))}"
         )
+        print(
+            "  breakdown at forward peak: "
+            f"PARAM={self._fmt_bytes(fw_peak_by_type.get(NodeType.PARAM, 0))}, "
+            f"ACT={self._fmt_bytes(fw_peak_by_type.get(NodeType.ACT, 0))}, "
+            f"GRAD={self._fmt_bytes(fw_peak_by_type.get(NodeType.GRAD, 0))}, "
+            f"OPT={self._fmt_bytes(fw_peak_by_type.get(NodeType.OPT, 0))}, "
+            f"OTHER={self._fmt_bytes(fw_peak_by_type.get(NodeType.OTHER, 0))}"
+        )
 
-        if peak_step >= 0:
-            alive_at_peak: List[Tuple[int, str, str]] = []
+        if fw_peak_step >= 0:
+            alive_at_fw_peak: List[Tuple[int, str, str]] = []
             for node, (born, dies) in alive.items():
-                if born <= peak_step <= dies:
-                    alive_at_peak.append(
+                if born <= fw_peak_step <= dies:
+                    alive_at_fw_peak.append(
                         (
                             self.node_mem_bytes[node.name],
                             node.name,
                             self.node_type.get(node, NodeType.OTHER).name,
                         )
                     )
-            alive_at_peak.sort(reverse=True)
-            print("  top alive tensors at peak (size, type, name):")
-            for sz, name, nt in alive_at_peak[:25]:
+            alive_at_fw_peak.sort(reverse=True)
+            print("  top alive tensors at forward peak (size, type, name):")
+            for sz, name, nt in alive_at_fw_peak[:25]:
                 print(f"    - {self._fmt_bytes(sz):>10s} | {nt:5s} | {name}")
 
     # ------------------------------------------------------------------
@@ -666,6 +679,57 @@ class GraphProfiler(fx.Interpreter):
 
         return peak_bytes, peak_bd
 
+    def _sweep_for_forward_peak(
+        self,
+        alive: Dict[fx.Node, Tuple[int, int]],
+    ) -> Tuple[int, int, Dict[NodeType, int]]:
+        """Sweep only the forward-pass region to find peak memory in forward.
+
+        Sweeps steps 0 to ``sep_idx`` (inclusive) to track maximum memory
+        reached during forward pass only. Returns ``(peak_step, peak_bytes, breakdown)``.
+        """
+        peak_step  = -1
+        peak_bytes = 0
+        peak_bd:   Dict[NodeType, int] = {}
+
+        for step in range(min(self.sep_idx + 1, len(self.node_list))):
+            total   = 0
+            by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+
+            for node, (born, dies) in alive.items():
+                if born <= step <= dies:
+                    sz = self.node_mem_bytes[node.name]
+                    total += sz
+                    by_type[self.node_type.get(node, NodeType.OTHER)] += sz
+
+            if total > peak_bytes:
+                peak_bytes = total
+                peak_bd    = by_type
+                peak_step  = step
+
+        return peak_step, peak_bytes, peak_bd
+
+    def _filter_alive_for_checkpoint(
+        self,
+        alive: Dict[fx.Node, Tuple[int, int]],
+        checkpoint_plan: Any,
+    ) -> Dict[fx.Node, Tuple[int, int]]:
+        """Filter alive ranges to exclude recomputed activations.
+        
+        Keeps only nodes that are in checkpoint_plan.retained_nodes,
+        or are not activations (e.g., PARAM, GRAD, OPT).
+        """
+        filtered: Dict[fx.Node, Tuple[int, int]] = {}
+        for node, (born, dies) in alive.items():
+            # Keep node if it's not an activation, or if it's in retained set
+            node_type = self.node_type.get(node, NodeType.OTHER)
+            if node_type != NodeType.ACT:
+                filtered[node] = (born, dies)
+            elif node in checkpoint_plan.retained_nodes:
+                filtered[node] = (born, dies)
+            # else: skip recomputed activations (they don't live in forward with checkpoint)
+        return filtered
+
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
@@ -674,8 +738,18 @@ class GraphProfiler(fx.Interpreter):
         self,
         title: str = "",
         save_path: Optional[str] = None,
+        forward_only: bool = True,
+        checkpoint_plan: Optional[Any] = None,
     ) -> None:
-        """Save a bar + pie chart of peak memory by NodeType."""
+        """Save a bar + pie chart of peak memory by NodeType.
+        
+        Args:
+            title: Optional title suffix.
+            save_path: Where to save the plot file.
+            forward_only: If True, plot forward-pass peak; if False, plot overall peak.
+            checkpoint_plan: Optional CheckpointPlan to show impact of checkpointing.
+                If provided, generates two plots: baseline and with-checkpoint.
+        """
         try:
             import matplotlib
             import matplotlib.pyplot as plt
@@ -688,7 +762,73 @@ class GraphProfiler(fx.Interpreter):
             import importlib
             importlib.reload(plt)
 
-        peak, breakdown = self.compute_peak_memory()
+        decomposed = self._find_decomposed_parents()
+        alive = self._build_alive_ranges(decomposed)
+
+        if forward_only:
+            fw_peak_step, peak, breakdown = self._sweep_for_forward_peak(alive)
+            plot_region = "Forward Pass"
+        else:
+            peak, breakdown = self.compute_peak_memory()
+            plot_region = "Overall"
+
+        # Generate baseline plot
+        self._generate_single_plot(
+            breakdown, peak, plot_region, title, save_path, "Baseline (Without Checkpoint)"
+        )
+
+        # If checkpoint plan provided, generate with-checkpoint plot
+        if checkpoint_plan is not None:
+            alive_with_cp = self._filter_alive_for_checkpoint(alive, checkpoint_plan)
+            if forward_only:
+                fw_peak_step_cp, peak_cp, breakdown_cp = self._sweep_for_forward_peak(alive_with_cp)
+            else:
+                peak_cp, breakdown_cp = self.compute_peak_memory_filtered(alive_with_cp)
+            
+            if save_path:
+                cp_save_path = save_path.replace(".png", "_with_checkpoint.png")
+            else:
+                cp_save_path = None
+            
+            self._generate_single_plot(
+                breakdown_cp, peak_cp, plot_region, title, cp_save_path, "With Checkpoint"
+            )
+
+    def compute_peak_memory_filtered(
+        self,
+        alive: Dict[fx.Node, Tuple[int, int]],
+    ) -> Tuple[int, Dict[NodeType, int]]:
+        """Compute peak memory from a filtered alive set."""
+        peak_bytes = 0
+        peak_bd:   Dict[NodeType, int] = {}
+
+        for step in range(len(self.node_list)):
+            total   = 0
+            by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+
+            for node, (born, dies) in alive.items():
+                if born <= step <= dies:
+                    sz = self.node_mem_bytes[node.name]
+                    total += sz
+                    by_type[self.node_type.get(node, NodeType.OTHER)] += sz
+
+            if total > peak_bytes:
+                peak_bytes = total
+                peak_bd    = by_type
+
+        return peak_bytes, peak_bd
+
+    def _generate_single_plot(
+        self,
+        breakdown: Dict[NodeType, int],
+        peak: int,
+        region: str,
+        title: str,
+        save_path: Optional[str],
+        scenario: str,
+    ) -> None:
+        """Generate a single bar+pie plot for a given scenario."""
+        import matplotlib.pyplot as plt
 
         categories = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPT, NodeType.OTHER]
         labels     = [nt.name for nt in categories]
@@ -708,7 +848,7 @@ class GraphProfiler(fx.Interpreter):
                     ha="center", va="bottom", fontsize=10,
                 )
         ax_bar.set_ylabel("Memory (MB)")
-        ax_bar.set_title(f"Peak Memory Breakdown{' -- ' + title if title else ''}")
+        ax_bar.set_title(f"Peak Memory Breakdown ({region}) - {scenario}{' -- ' + title if title else ''}")
         ax_bar.grid(axis="y", alpha=0.3)
 
         # Pie chart -- percentage breakdown

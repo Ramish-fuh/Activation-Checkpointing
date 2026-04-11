@@ -159,17 +159,35 @@ class Experiment:
                 json.dump(plan.to_dict(), f, indent=2)
             print(f"Saved plan: {os.path.abspath(plan_path)}")
 
-            save_path = os.path.join(
+            # Generate forward-only peak plot (with checkpoint comparison)
+            save_path_fw = os.path.join(
                 plots_dir,
-                f"peak_memory_breakdown_{self.model_name}_bs{self.batch_size}.png",
+                f"peak_memory_breakdown_fw_{self.model_name}_bs{self.batch_size}.png",
             )
             try:
                 graph_profiler.plot_peak_memory_breakdown(
                     title=f"{self.model_name} (bs={self.batch_size})",
-                    save_path=save_path,
+                    save_path=save_path_fw,
+                    forward_only=True,
+                    checkpoint_plan=plan,
                 )
             except Exception as e:
-                print(f"Warning: could not save plot: {e}")
+                print(f"Warning: could not save forward-only plot: {e}")
+
+            # Generate overall peak plot (with checkpoint comparison)
+            save_path_overall = os.path.join(
+                plots_dir,
+                f"peak_memory_breakdown_overall_{self.model_name}_bs{self.batch_size}.png",
+            )
+            try:
+                graph_profiler.plot_peak_memory_breakdown(
+                    title=f"{self.model_name} (bs={self.batch_size})",
+                    save_path=save_path_overall,
+                    forward_only=False,
+                    checkpoint_plan=plan,
+                )
+            except Exception as e:
+                print(f"Warning: could not save overall plot: {e}")
 
         return gm
 
