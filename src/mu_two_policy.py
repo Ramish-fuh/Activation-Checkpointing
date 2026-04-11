@@ -75,7 +75,7 @@ class CheckpointPlan:
     estimated_peak_after_bytes: Optional[int] = None  # peak estimate after selected recompute
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize the plan without raw FX node objects."""
+        """Serialize the plan without raw FX node objects for later analysis."""
         return {
             PlanDictKey.RETAINED_NODES.value: sorted(n.name for n in self.retained_nodes),
             PlanDictKey.RECOMPUTE_NODES.value: sorted(n.name for n in self.recompute_nodes),
