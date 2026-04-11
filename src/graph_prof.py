@@ -49,13 +49,15 @@ class NodeType(Enum):
     PARAM -- model weight / bias  (identified via optimizer args)
     ACT   -- intermediate activation crossing the fwd -> bwd boundary
     GRAD  -- gradient tensor      (identified via optimizer args)
-    OTHER -- loss ops, optimizer bookkeeping, markers, scalars, etc.
+    OPT   -- optimizer state tensor (e.g., Adam exp_avg / exp_avg_sq)
+    OTHER -- loss ops, markers, scalars, and uncategorized tensors
     """
 
     PARAM = 0
     ACT   = 1
     GRAD  = 2
-    OTHER = 3
+    OPT   = 3
+    OTHER = 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -308,18 +310,38 @@ class GraphProfiler(fx.Interpreter):
                 self.node_type[node] = NodeType.PARAM
             elif node in self.grad_nodes:
                 self.node_type[node] = NodeType.GRAD
-            elif self._is_forward_activation(node):
+            elif node in self.optimizer_state_nodes:
+                self.node_type[node] = NodeType.OPT
+            elif self._is_forward_candidate(node) and self._has_backward_reachability(node):
                 self._register_activation(node)
             else:
                 self.node_type[node] = NodeType.OTHER
 
-    def _is_forward_activation(self, node: fx.Node) -> bool:
+    def _is_forward_candidate(self, node: fx.Node) -> bool:
         """True if *node* is a non-I/O forward intermediate tensor candidate."""
         return (
             self.node_index[node] < self.sep_idx
             and node.op not in (OP.PLACEHOLDER, OP.OUTPUT)
             and node.target is not torch.ops.separator.sep.default
         )
+
+    def _reachable_users(self, node: fx.Node) -> Set[fx.Node]:
+        """Return all transitive consumer nodes reachable from *node*."""
+        seen: Set[fx.Node] = set()
+        stack: List[fx.Node] = list(node.users)
+
+        while stack:
+            user = stack.pop()
+            if user in seen:
+                continue
+            seen.add(user)
+            stack.extend(list(user.users))
+
+        return seen
+
+    def _has_backward_reachability(self, node: fx.Node) -> bool:
+        """True if any transitive consumer of *node* lies in backward region."""
+        return any(self.node_index[u] >= self.sep_bw_idx for u in self._reachable_users(node))
 
     def _register_activation(self, node: fx.Node) -> None:
         """Label *node* as ACT and record where its lifetime crosses regions.
@@ -330,8 +352,9 @@ class GraphProfiler(fx.Interpreter):
         self.node_type[node] = NodeType.ACT
         self.intermediate_nodes.append(node)
 
-        fw_users = [u for u in node.users if self.node_index[u] < self.sep_bw_idx]
-        bw_users = [u for u in node.users if self.node_index[u] >= self.sep_bw_idx]
+        reachable_users = self._reachable_users(node)
+        fw_users = [u for u in reachable_users if self.node_index[u] < self.sep_bw_idx]
+        bw_users = [u for u in reachable_users if self.node_index[u] >= self.sep_bw_idx]
 
         self.last_fw_access[node] = (
             max(fw_users, key=lambda u: self.node_index[u]) if fw_users else None
@@ -349,11 +372,13 @@ class GraphProfiler(fx.Interpreter):
         counts: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
         for nt in self.node_type.values():
             counts[nt] += 1
+        fw_candidates = sum(1 for n in self.node_list if self._is_forward_candidate(n))
         checkpointable = sum(1 for n in self.intermediate_nodes if self.first_bw_access.get(n) is not None)
         print("\n--- Node Classification ---")
         for nt in NodeType:
             print(f"  {nt.name:8s}: {counts[nt]} nodes")
-        print(f"  {'ACT(w/ BW use)':8s}: {checkpointable} nodes")
+        print(f"  {'FW candidates':14s}: {fw_candidates} nodes")
+        print(f"  {'ACT(w/ BW use)':14s}: {checkpointable} nodes")
 
     def _print_activation_table(self) -> None:
         """Print each intermediate activation with its memory size and liveness endpoints."""
@@ -392,7 +417,7 @@ class GraphProfiler(fx.Interpreter):
         """Print simulated peak memory broken down by NodeType."""
         peak, breakdown = self.compute_peak_memory()
         print("\n--- Memory Summary ---")
-        for nt in (NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OTHER):
+        for nt in (NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPT, NodeType.OTHER):
             print(f"  {nt.name:8s}: {self._fmt_bytes(breakdown.get(nt, 0))}")
         print(f"  {'PEAK':8s}: {self._fmt_bytes(peak)}")
 
@@ -430,7 +455,7 @@ class GraphProfiler(fx.Interpreter):
         Rules:
         - Skip nodes with 0 measured bytes.
         - Skip tuple/container parents listed in ``decomposed``.
-        - PARAM and GRAD nodes live for the full iteration: ``(0, last_idx)``.
+        - PARAM, GRAD, and OPT nodes live for the full iteration: ``(0, last_idx)``.
         - Other tensor nodes live from their own index to their last consumer.
         - ``getitem`` nodes are counted only when they extract from a decomposed
             parent (to avoid counting unrelated edge cases).
@@ -450,8 +475,16 @@ class GraphProfiler(fx.Interpreter):
                     continue
 
             nt = self.node_type.get(node, NodeType.OTHER)
-            if nt in (NodeType.PARAM, NodeType.GRAD):
+            if nt in (NodeType.PARAM, NodeType.GRAD, NodeType.OPT):
                 ranges[node] = (0, last)
+            elif nt is NodeType.ACT:
+                born = self.node_index[node]
+                fbw = self.first_bw_access.get(node)
+                if fbw is not None:
+                    dies = self.node_index[fbw]
+                else:
+                    dies = max((self.node_index[u] for u in node.users), default=born)
+                ranges[node] = (born, dies)
             else:
                 born = self.node_index[node]
                 dies = max((self.node_index[u] for u in node.users), default=born)
@@ -512,10 +545,10 @@ class GraphProfiler(fx.Interpreter):
 
         peak, breakdown = self.compute_peak_memory()
 
-        categories = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OTHER]
+        categories = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPT, NodeType.OTHER]
         labels     = [nt.name for nt in categories]
         sizes_mb   = [breakdown.get(nt, 0) / 1024**2 for nt in categories]
-        colors     = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
+        colors     = ["#4C72B0", "#DD8452", "#55A868", "#8172B3", "#C44E52"]
 
         fig, (ax_bar, ax_pie) = plt.subplots(1, 2, figsize=(12, 5))
 
