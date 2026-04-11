@@ -18,11 +18,34 @@ class PolicyConfig:
 
 class SkipReason(str, Enum):
     NO_BACKWARD_USE = "no_backward_use"
-    NON_FORWARD_DEPENDENCY = "non_forward_dependency"
+    NON_FORWARD_DEPENDENCY = "non_forward_dependency" #  would need something outside the allowed forward region.
     TARGET_PEAK_REACHED = "target_peak_reached"
-    BELOW_MIN_MEMORY_THRESHOLD = "below_min_memory_threshold"
-    OVER_RECOMPUTE_BUDGET = "over_recompute_budget"
+    BELOW_MIN_MEMORY_THRESHOLD = "below_min_memory_threshold" # would save too little memory to be worth it.
+    OVER_RECOMPUTE_BUDGET = "over_recompute_budget" # would exceed user-configured recompute overhead limit.
     DEPENDS_ON_RECOMPUTED_ACTIVATION = "depends_on_recomputed_activation"
+
+
+class PlanDictKey(str, Enum):
+    RETAINED_NODES = "retained_nodes"
+    RECOMPUTE_NODES = "recompute_nodes"
+    FIRST_BACKWARD_USE = "first_backward_use"
+    REQUIRED_RECOMPUTE_INPUTS = "required_recompute_inputs"
+    ESTIMATED_MEMORY_SAVED_BYTES = "estimated_memory_saved_bytes"
+    ESTIMATED_RECOMPUTE_OVERHEAD_MS = "estimated_recompute_overhead_ms"
+    ESTIMATED_PEAK_BEFORE_BYTES = "estimated_peak_before_bytes"
+    ESTIMATED_PEAK_AFTER_BYTES = "estimated_peak_after_bytes"
+    DECISIONS = "decisions"
+
+
+class DecisionDictKey(str, Enum):
+    NODE_NAME = "node_name"
+    SELECTED_FOR_RECOMPUTE = "selected_for_recompute"
+    MEMORY_SAVED_BYTES = "memory_saved_bytes"
+    RECOMPUTE_COST_MS = "recompute_cost_ms"
+    SCORE = "score"
+    FIRST_BACKWARD_USE_NAME = "first_backward_use_name"
+    REQUIRED_INPUT_NAMES = "required_input_names"
+    SKIP_REASON = "skip_reason"
 
 
 @dataclass
@@ -34,7 +57,7 @@ class NodeDecision:
     recompute_cost_ms: float
     score: float # ratio of memory_saved_bytes to recompute_cost_ms
     first_backward_use_name: Optional[str]
-    required_input_names: List[str]
+    required_input_names: List[str] # names of boundary inputs required to recompute this node
     skip_reason: Optional[SkipReason] = None
 
 
@@ -43,40 +66,40 @@ class CheckpointPlan:
     """Structured output consumed by graph rewriting and reporting."""
     retained_nodes: Set[Any]
     recompute_nodes: Set[Any]
-    first_backward_use: Dict[Any, Any]
-    required_recompute_inputs: Dict[Any, Set[Any]]
-    decisions: List[NodeDecision] = field(default_factory=list)
-    estimated_memory_saved_bytes: int = 0
-    estimated_recompute_overhead_ms: float = 0.0
-    estimated_peak_before_bytes: Optional[int] = None
-    estimated_peak_after_bytes: Optional[int] = None
+    first_backward_use: Dict[Any, Any]  # recompute node -> first backward consumer
+    required_recompute_inputs: Dict[Any, Set[Any]]  # recompute node -> boundary inputs
+    decisions: List[NodeDecision] = field(default_factory=list)  # per-node decision trace
+    estimated_memory_saved_bytes: int = 0  # summed estimated memory saved
+    estimated_recompute_overhead_ms: float = 0.0  # summed recompute runtime overhead
+    estimated_peak_before_bytes: Optional[int] = None  # baseline simulated peak
+    estimated_peak_after_bytes: Optional[int] = None  # peak estimate after selected recompute
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the plan without raw FX node objects."""
         return {
-            "retained_nodes": sorted(n.name for n in self.retained_nodes),
-            "recompute_nodes": sorted(n.name for n in self.recompute_nodes),
-            "first_backward_use": {
+            PlanDictKey.RETAINED_NODES.value: sorted(n.name for n in self.retained_nodes),
+            PlanDictKey.RECOMPUTE_NODES.value: sorted(n.name for n in self.recompute_nodes),
+            PlanDictKey.FIRST_BACKWARD_USE.value: {
                 n.name: bw.name for n, bw in self.first_backward_use.items()
             },
-            "required_recompute_inputs": {
+            PlanDictKey.REQUIRED_RECOMPUTE_INPUTS.value: {
                 n.name: sorted(inp.name for inp in inputs)
                 for n, inputs in self.required_recompute_inputs.items()
             },
-            "estimated_memory_saved_bytes": self.estimated_memory_saved_bytes,
-            "estimated_recompute_overhead_ms": self.estimated_recompute_overhead_ms,
-            "estimated_peak_before_bytes": self.estimated_peak_before_bytes,
-            "estimated_peak_after_bytes": self.estimated_peak_after_bytes,
-            "decisions": [
+            PlanDictKey.ESTIMATED_MEMORY_SAVED_BYTES.value: self.estimated_memory_saved_bytes,
+            PlanDictKey.ESTIMATED_RECOMPUTE_OVERHEAD_MS.value: self.estimated_recompute_overhead_ms,
+            PlanDictKey.ESTIMATED_PEAK_BEFORE_BYTES.value: self.estimated_peak_before_bytes,
+            PlanDictKey.ESTIMATED_PEAK_AFTER_BYTES.value: self.estimated_peak_after_bytes,
+            PlanDictKey.DECISIONS.value: [
                 {
-                    "node_name": d.node_name,
-                    "selected_for_recompute": d.selected_for_recompute,
-                    "memory_saved_bytes": d.memory_saved_bytes,
-                    "recompute_cost_ms": d.recompute_cost_ms,
-                    "score": d.score,
-                    "first_backward_use_name": d.first_backward_use_name,
-                    "required_input_names": list(d.required_input_names),
-                    "skip_reason": d.skip_reason.value if d.skip_reason is not None else None,
+                    DecisionDictKey.NODE_NAME.value: d.node_name,
+                    DecisionDictKey.SELECTED_FOR_RECOMPUTE.value: d.selected_for_recompute,
+                    DecisionDictKey.MEMORY_SAVED_BYTES.value: d.memory_saved_bytes,
+                    DecisionDictKey.RECOMPUTE_COST_MS.value: d.recompute_cost_ms,
+                    DecisionDictKey.SCORE.value: d.score,
+                    DecisionDictKey.FIRST_BACKWARD_USE_NAME.value: d.first_backward_use_name,
+                    DecisionDictKey.REQUIRED_INPUT_NAMES.value: list(d.required_input_names),
+                    DecisionDictKey.SKIP_REASON.value: d.skip_reason.value if d.skip_reason is not None else None,
                 }
                 for d in self.decisions
             ],
