@@ -329,19 +329,42 @@ class GraphProfiler(fx.Interpreter):
             and node.target is not torch.ops.separator.sep.default
         )
 
-    def _reachable_users(self, node: fx.Node) -> Set[fx.Node]:
-        """Return all transitive consumer nodes reachable from *node*."""
-        seen: Set[fx.Node] = set()
-        stack: List[fx.Node] = list(node.users)
+    def _activation_use_sets(self, node: fx.Node) -> Tuple[Set[fx.Node], Set[fx.Node]]:
+        """Return forward-closure users and true backward consumers for activation logic.
+
+        Crucially, this traversal does NOT walk through the loss region
+        (``sep_idx < idx < sep_bw_idx``), which prevents false dependencies
+        through the loss-seeding chain (e.g. ones_like -> sep_backward).
+        """
+        forward_reachable: Set[fx.Node] = set()
+        backward_consumers: Set[fx.Node] = set()
+
+        stack: List[fx.Node] = [node]
+        seen_forward: Set[fx.Node] = {node}
 
         while stack:
-            user = stack.pop()
-            if user in seen:
-                continue
-            seen.add(user)
-            stack.extend(list(user.users))
+            cur = stack.pop()
+            for user in cur.users:
+                u_idx = self.node_index[user]
 
-        return seen
+                # Forward region: continue traversal.
+                if u_idx < self.sep_idx:
+                    forward_reachable.add(user)
+                    if user not in seen_forward:
+                        seen_forward.add(user)
+                        stack.append(user)
+                    continue
+
+                # Backward region: treat as real backward use unless it is the marker.
+                if u_idx >= self.sep_bw_idx:
+                    if user.target is not torch.ops.separator.sep_backward.default:
+                        backward_consumers.add(user)
+                    continue
+
+                # Loss region (between sep and sep_backward): ignore this path.
+                # It should not establish activation dependency for checkpointing.
+
+        return forward_reachable, backward_consumers
 
     def _has_backward_reachability(self, node: fx.Node) -> bool:
         """True if any transitive consumer of *node* is a real backward op.
@@ -349,11 +372,8 @@ class GraphProfiler(fx.Interpreter):
         Excludes the ``sep_backward`` marker itself, which is only a boundary
         sentinel and should not count as a true activation use.
         """
-        return any(
-            self.node_index[u] >= self.sep_bw_idx
-            and u.target is not torch.ops.separator.sep_backward.default
-            for u in self._reachable_users(node)
-        )
+        _, bw_users = self._activation_use_sets(node)
+        return len(bw_users) > 0
 
     def _register_activation(self, node: fx.Node) -> None:
         """Label *node* as ACT and record where its lifetime crosses regions.
@@ -364,14 +384,8 @@ class GraphProfiler(fx.Interpreter):
         self.node_type[node] = NodeType.ACT
         self.intermediate_nodes.append(node)
 
-        reachable_users = self._reachable_users(node)
-        fw_users = [u for u in reachable_users if self.node_index[u] < self.sep_bw_idx]
-        bw_users = [
-            u
-            for u in reachable_users
-            if self.node_index[u] >= self.sep_bw_idx
-            and u.target is not torch.ops.separator.sep_backward.default
-        ]
+        fw_users, bw_users_set = self._activation_use_sets(node)
+        bw_users = list(bw_users_set)
 
         self.last_fw_access[node] = (
             max(fw_users, key=lambda u: self.node_index[u]) if fw_users else None
