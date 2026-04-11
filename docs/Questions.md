@@ -56,3 +56,7 @@ why choose fx and why does the do and what functions does it have thae we need a
 
 
 why memory goes up doing weight updates
+
+
+TODO:
+- Add the paper's active-swap branch to mu-TWO; the current code only selects recompute activations and does not implement the hybrid swap/recompute scheduler.
