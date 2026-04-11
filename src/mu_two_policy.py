@@ -189,7 +189,11 @@ def build_checkpoint_plan(
     config = config or PolicyConfig()
     _validate_profiler_contract(graph_profiler)
 
-    activations = list(graph_profiler.intermediate_nodes)
+    activations = [
+        n
+        for n in graph_profiler.intermediate_nodes
+        if graph_profiler.first_bw_access.get(n) is not None
+    ]
     retained: Set[Any] = set(activations)
     recompute: Set[Any] = set()
     first_bw_use: Dict[Any, Any] = {}

@@ -308,17 +308,17 @@ class GraphProfiler(fx.Interpreter):
                 self.node_type[node] = NodeType.PARAM
             elif node in self.grad_nodes:
                 self.node_type[node] = NodeType.GRAD
-            elif self._is_intermediate_activation(node):
+            elif self._is_forward_activation(node):
                 self._register_activation(node)
             else:
                 self.node_type[node] = NodeType.OTHER
 
-    def _is_intermediate_activation(self, node: fx.Node) -> bool:
-        """True if *node* is a forward compute node consumed by backward."""
+    def _is_forward_activation(self, node: fx.Node) -> bool:
+        """True if *node* is a non-I/O forward intermediate tensor candidate."""
         return (
-            self.node_region[node] == "forward"
+            self.node_index[node] < self.sep_idx
             and node.op not in (OP.PLACEHOLDER, OP.OUTPUT)
-            and any(self.node_index[u] >= self.sep_bw_idx for u in node.users)
+            and node.target is not torch.ops.separator.sep.default
         )
 
     def _register_activation(self, node: fx.Node) -> None:
@@ -330,7 +330,7 @@ class GraphProfiler(fx.Interpreter):
         self.node_type[node] = NodeType.ACT
         self.intermediate_nodes.append(node)
 
-        fw_users = [u for u in node.users if self.node_index[u] <  self.sep_bw_idx]
+        fw_users = [u for u in node.users if self.node_index[u] < self.sep_bw_idx]
         bw_users = [u for u in node.users if self.node_index[u] >= self.sep_bw_idx]
 
         self.last_fw_access[node] = (
@@ -349,9 +349,11 @@ class GraphProfiler(fx.Interpreter):
         counts: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
         for nt in self.node_type.values():
             counts[nt] += 1
+        checkpointable = sum(1 for n in self.intermediate_nodes if self.first_bw_access.get(n) is not None)
         print("\n--- Node Classification ---")
         for nt in NodeType:
             print(f"  {nt.name:8s}: {counts[nt]} nodes")
+        print(f"  {'ACT(w/ BW use)':8s}: {checkpointable} nodes")
 
     def _print_activation_table(self) -> None:
         """Print each intermediate activation with its memory size and liveness endpoints."""
