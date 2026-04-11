@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from graph_prof import NodeType
@@ -15,6 +16,15 @@ class PolicyConfig:
     target_peak_memory_bytes: Optional[int] = None
 
 
+class SkipReason(str, Enum):
+    NO_BACKWARD_USE = "no_backward_use"
+    NON_FORWARD_DEPENDENCY = "non_forward_dependency"
+    TARGET_PEAK_REACHED = "target_peak_reached"
+    BELOW_MIN_MEMORY_THRESHOLD = "below_min_memory_threshold"
+    OVER_RECOMPUTE_BUDGET = "over_recompute_budget"
+    DEPENDS_ON_RECOMPUTED_ACTIVATION = "depends_on_recomputed_activation"
+
+
 @dataclass
 class NodeDecision:
     """Per-node decision trace for debugging and reporting."""
@@ -22,10 +32,10 @@ class NodeDecision:
     selected_for_recompute: bool
     memory_saved_bytes: int
     recompute_cost_ms: float
-    score: float
+    score: float # ratio of memory_saved_bytes to recompute_cost_ms
     first_backward_use_name: Optional[str]
     required_input_names: List[str]
-    skip_reason: Optional[str] = None
+    skip_reason: Optional[SkipReason] = None
 
 
 @dataclass
@@ -66,7 +76,7 @@ class CheckpointPlan:
                     "score": d.score,
                     "first_backward_use_name": d.first_backward_use_name,
                     "required_input_names": list(d.required_input_names),
-                    "skip_reason": d.skip_reason,
+                    "skip_reason": d.skip_reason.value if d.skip_reason is not None else None,
                 }
                 for d in self.decisions
             ],
@@ -95,7 +105,7 @@ class CheckpointPlan:
             print("\n  Top decisions:")
             for d in shown:
                 status = "RECOMPUTE" if d.selected_for_recompute else "retain"
-                reason = f" ({d.skip_reason})" if d.skip_reason else ""
+                reason = f" ({d.skip_reason.value})" if d.skip_reason else ""
                 print(
                     f"    {d.node_name:30s} {status:10s} "
                     f"score={d.score:10.4f} mem={_fmt_bytes(d.memory_saved_bytes):>10s} "
@@ -103,7 +113,7 @@ class CheckpointPlan:
                 )
 
 
-CandidateRow = Tuple[Any, int, float, float, Optional[str], Set[Any], Optional[Any]]
+CandidateRow = Tuple[Any, int, float, float, Optional[SkipReason], Set[Any], Optional[Any]]
 
 
 def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> List[CandidateRow]:
@@ -116,13 +126,21 @@ def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> L
 
         if fbw is None:
             candidates.append(
-                (node, mem, cost, 0.0, "no_backward_use", required_inputs, None)
+                (node, mem, cost, 0.0, SkipReason.NO_BACKWARD_USE, required_inputs, None)
             )
             continue
 
         if legality_issue is not None:
             candidates.append(
-                (node, mem, cost, 0.0, legality_issue, required_inputs, fbw)
+                (
+                    node,
+                    mem,
+                    cost,
+                    0.0,
+                    SkipReason(legality_issue),
+                    required_inputs,
+                    fbw,
+                )
             )
             continue
 
@@ -133,27 +151,27 @@ def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> L
 
 def _policy_skip_reason(
     config: PolicyConfig,
-    pre_skip_reason: Optional[str],
+    pre_skip_reason: Optional[SkipReason],
     target_peak_reached: bool,
     mem: int,
     cost: float,
     selected_cost_ms: float,
     req_inputs: Set[Any],
     recompute: Set[Any],
-) -> Optional[str]:
+) -> Optional[SkipReason]:
     if pre_skip_reason is not None:
         return pre_skip_reason
     if target_peak_reached:
-        return "target_peak_reached"
+        return SkipReason.TARGET_PEAK_REACHED
     if mem < config.min_memory_saved_bytes:
-        return "below_min_memory_threshold"
+        return SkipReason.BELOW_MIN_MEMORY_THRESHOLD
     if (
         config.max_recompute_overhead_ms is not None
         and selected_cost_ms + cost > config.max_recompute_overhead_ms
     ):
-        return "over_recompute_budget"
+        return SkipReason.OVER_RECOMPUTE_BUDGET
     if req_inputs.intersection(recompute):
-        return "depends_on_recomputed_activation"
+        return SkipReason.DEPENDS_ON_RECOMPUTED_ACTIVATION
     return None
 
 
@@ -217,7 +235,7 @@ def _select_recompute_nodes(
 def _required_recompute_inputs(
     target_node: Any,
     graph_profiler: Any,
-) -> Tuple[Set[Any], Optional[str]]:
+) -> Tuple[Set[Any], Optional[SkipReason]]:
     """Return legal boundary inputs needed to recompute an activation.
 
     Boundary inputs are placeholders and retained activations (other than
@@ -227,14 +245,14 @@ def _required_recompute_inputs(
     required_inputs: Set[Any] = set()
     visited: Set[Any] = set()
 
-    def visit(node: Any) -> Optional[str]:
+    def visit(node: Any) -> Optional[SkipReason]:
         if node in visited:
             return None
         visited.add(node)
 
         region = graph_profiler.node_region.get(node)
         if region != "forward":
-            return "non_forward_dependency"
+            return SkipReason.NON_FORWARD_DEPENDENCY
 
         if node.op == "placeholder":
             required_inputs.add(node)
