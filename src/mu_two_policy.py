@@ -262,7 +262,7 @@ def _select_recompute_nodes(
             req_inputs=req_inputs,
             recompute=recompute,
         )
-        selected = skip_reason is None
+        selected = skip_reason is None # if there's no reason to skip, we select this node for recompute
 
         if selected:
             recompute.add(node)
@@ -345,7 +345,7 @@ def _required_recompute_inputs(
     return required_inputs, None
 
 
-def _validate_profiler_contract(graph_profiler: Any) -> None:
+def _validate_profiler_contract(graph_profiler: Any) -> None: # Check that the GraphProfiler provides all required attributes for policy logic, with appropriate types.
     required_attrs = [
         "node_list",
         "node_index",
@@ -363,7 +363,7 @@ def _validate_profiler_contract(graph_profiler: Any) -> None:
         )
 
 
-def _fmt_bytes(b: int) -> str:
+def _fmt_bytes(b: int) -> str: # Format bytes as human-readable string with appropriate units.
     for unit, threshold in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
         if b >= threshold:
             return f"{b / threshold:.1f} {unit}"
