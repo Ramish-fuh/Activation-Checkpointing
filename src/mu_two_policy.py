@@ -148,6 +148,12 @@ class CandidateRow:
 
 
 def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> List[CandidateRow]:
+    """Build per-activation candidate rows used by policy selection.
+
+    Each row contains memory/cost signals, first backward use, legal
+    recompute boundary inputs, and an optional pre-skip reason for nodes
+    disqualified before budget/threshold checks.
+    """
     candidates: List[CandidateRow] = []
     for node in activations:
         mem = int(graph_profiler.node_mem_bytes.get(node.name, 0))
