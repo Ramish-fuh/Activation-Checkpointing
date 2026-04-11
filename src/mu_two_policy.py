@@ -136,7 +136,15 @@ class CheckpointPlan:
                 )
 
 
-CandidateRow = Tuple[Any, int, float, float, Optional[SkipReason], Set[Any], Optional[Any]]
+@dataclass
+class CandidateRow:
+    node: Any
+    mem: int
+    cost: float
+    score: float
+    pre_skip_reason: Optional[SkipReason] #gets set during candidate collection in _collect_policy_candidates based on static legality checks. eg. no backward use, non-forward dependency, etc.
+    req_inputs: Set[Any]
+    fbw_node: Optional[Any]
 
 
 def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> List[CandidateRow]:
@@ -145,30 +153,48 @@ def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> L
         mem = int(graph_profiler.node_mem_bytes.get(node.name, 0))
         cost = float(graph_profiler.node_avg_runtime.get(node.name, 0.0))
         fbw = graph_profiler.first_bw_access.get(node)
-        required_inputs, legality_issue = _required_recompute_inputs(node, graph_profiler)
+        required_inputs, pre_skip_reason = _required_recompute_inputs(node, graph_profiler)
 
         if fbw is None:
             candidates.append(
-                (node, mem, cost, 0.0, SkipReason.NO_BACKWARD_USE, required_inputs, None)
+                CandidateRow(
+                    node=node,
+                    mem=mem,
+                    cost=cost,
+                    score=0.0,
+                    pre_skip_reason=SkipReason.NO_BACKWARD_USE,
+                    req_inputs=required_inputs,
+                    fbw_node=None,
+                )
             )
             continue
 
-        if legality_issue is not None:
+        if pre_skip_reason is not None:
             candidates.append(
-                (
-                    node,
-                    mem,
-                    cost,
-                    0.0,
-                    SkipReason(legality_issue),
-                    required_inputs,
-                    fbw,
+                CandidateRow(
+                    node=node,
+                    mem=mem,
+                    cost=cost,
+                    score=0.0,
+                    pre_skip_reason=pre_skip_reason,
+                    req_inputs=required_inputs,
+                    fbw_node=fbw,
                 )
             )
             continue
 
         score = float(mem) / max(cost, 1e-6)
-        candidates.append((node, mem, cost, score, None, required_inputs, fbw))
+        candidates.append(
+            CandidateRow(
+                node=node,
+                mem=mem,
+                cost=cost,
+                score=score,
+                pre_skip_reason=None,
+                req_inputs=required_inputs,
+                fbw_node=fbw,
+            )
+        )
     return candidates
 
 
@@ -212,7 +238,14 @@ def _select_recompute_nodes(
     selected_cost_ms = 0.0
     target_peak_reached = False
 
-    for node, mem, cost, score, pre_skip_reason, req_inputs, fbw_node in candidates:
+    for row in candidates:
+        node = row.node
+        mem = row.mem
+        cost = row.cost
+        score = row.score
+        pre_skip_reason = row.pre_skip_reason
+        req_inputs = row.req_inputs
+        fbw_node = row.fbw_node
         skip_reason = _policy_skip_reason(
             config=config,
             pre_skip_reason=pre_skip_reason,
@@ -355,9 +388,9 @@ def build_checkpoint_plan(
     # Deterministic ordering: best score, then larger memory, then topological order.
     candidates.sort(
         key=lambda row: (
-            row[3],
-            row[1],
-            -graph_profiler.node_index[row[0]],
+            row.score,
+            row.mem,
+            -graph_profiler.node_index[row.node],
         ),
         reverse=True,
     )
