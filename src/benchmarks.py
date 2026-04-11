@@ -2,7 +2,7 @@
 # benchmarks.py
 #
 # Experiment harness for tracing and profiling a single training step.
-# Supports Transformer, Resnet18, and Resnet50 architectures.  The
+# Supports BERT and Resnet152 architectures. The
 # graph_transformation callback runs the GraphProfiler and saves a
 # peak-memory breakdown plot after the first compiled iteration.
 # ============================================================================
@@ -10,7 +10,6 @@
 import os
 import sys
 import json
-import importlib
 from typing import Any, Dict, List
 
 import torch
@@ -18,26 +17,26 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.fx as fx
-from torch.testing._internal.distributed._tensor.common_dtensor import (
-    ModelArgs,
-    Transformer,
-    )
-from torchvision.models import resnet18, resnet50
+from torchvision.models import resnet152
 from graph_prof import GraphProfiler
 from mu_two_policy import build_checkpoint_plan, PolicyConfig
 from graph_tracer import SEPFunction, compile
 
+try:
+    from transformers import BertConfig, BertForMaskedLM
+except ImportError:
+    BertConfig = None
+    BertForMaskedLM = None
+
 
 model_names: List[str] = [
-    "Transformer",
-    "Resnet18",
-    "Resnet50",
+    "Bert",
+    "Resnet152",
 ]
 
 model_batch_sizes: Dict[str, int] = {
-    "Transformer": 4,
-    "Resnet18": 16,
-    "Resnet50": 4,
+    "Bert": 4,
+    "Resnet152": 4,
 }
 
 
@@ -54,42 +53,48 @@ class Experiment:
         self.model_name = model_name
         self.batch_size = batch_size
 
-        if self.model_name == "Transformer":
-
-            vocab_size = 2048
-            bsz, seq_len = self.batch_size, 256
-            with torch.device(dev):
-                model_args = ModelArgs(
-                    n_layers=8,
-                    n_heads=4,
-                    vocab_size=vocab_size,
-                    max_seq_len=seq_len,
-                    dropout_p=0.1,
+        if self.model_name == "Bert":
+            if BertConfig is None or BertForMaskedLM is None:
+                raise ImportError(
+                    "BERT experiment requires transformers. Install with: pip install transformers"
                 )
-                self.model = Transformer(model_args)
-            src = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
-            tgt = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
-            self.example_inputs = (src, tgt)
 
-            def transformer_train_step(
+            vocab_size = 30522
+            bsz, seq_len = self.batch_size, 128
+            with torch.device(dev):
+                bert_cfg = BertConfig(
+                    vocab_size=vocab_size,
+                    hidden_size=256,
+                    num_hidden_layers=6,
+                    num_attention_heads=4,
+                    intermediate_size=1024,
+                    max_position_embeddings=512,
+                )
+                self.model = BertForMaskedLM(bert_cfg)
+
+            input_ids = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
+            labels = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
+            self.example_inputs = (input_ids, labels)
+
+            def bert_train_step(
                 model: nn.Module, optim: optim.Optimizer, example_inputs: Any
             ):
-                loss = self.loss_fn(model(example_inputs[0]), example_inputs[1])
-                loss = SEPFunction.apply(loss)
+                out = model(input_ids=example_inputs[0], labels=example_inputs[1])
+                loss = SEPFunction.apply(out.loss)
                 loss.backward()
                 optim.step()
                 optim.zero_grad()
 
-            self.train_step = transformer_train_step
+            self.train_step = bert_train_step
             self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, fused=True, capturable=True)
 
-        elif self.model_name in ["Resnet18", "Resnet50"]:
+        elif self.model_name == "Resnet152":
             inp = torch.randn(self.batch_size, 3, 224, 224, device=dev)
             num_classes = 10
             target = torch.randint(0, num_classes, (self.batch_size,), device=dev)
             self.example_inputs = (inp, target)
             with torch.device(dev):
-                self.model = resnet18() if self.model_name == "Resnet18" else resnet50()
+                self.model = resnet152(num_classes=num_classes)
 
             def resnet_train_step(
                 model: nn.Module, optim: optim.Optimizer, example_inputs: Any
@@ -139,16 +144,13 @@ class Experiment:
                 graph_profiler.run(*args)
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
-            # Use the paper-aligned scheduler with its default peak-memory target.
             plan = build_checkpoint_plan(graph_profiler, PolicyConfig())
 
-            # Save peak-memory breakdown plot to ../plots/
             plots_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), '..', 'plots'
             )
             os.makedirs(plots_dir, exist_ok=True)
 
-            # Save Phase 2 plan as a JSON artifact for reproducible analysis.
             plan_path = os.path.join(
                 plots_dir,
                 f"checkpoint_plan_{self.model_name}_bs{self.batch_size}.json",
@@ -179,7 +181,7 @@ class Experiment:
 
 if __name__ == "__main__":
     # Usage: python benchmarks.py [model_name] [batch_size]
-    # Defaults: Resnet18 with its standard batch size.
+    # Defaults: Resnet152 with its standard batch size.
     name = sys.argv[1] if len(sys.argv) > 1 else model_names[1]
     bs = int(sys.argv[2]) if len(sys.argv) > 2 else model_batch_sizes[name]
     print(f"Model: {name}, batch_size={bs}\n")
