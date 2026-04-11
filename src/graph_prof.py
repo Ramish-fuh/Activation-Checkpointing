@@ -340,8 +340,16 @@ class GraphProfiler(fx.Interpreter):
         return seen
 
     def _has_backward_reachability(self, node: fx.Node) -> bool:
-        """True if any transitive consumer of *node* lies in backward region."""
-        return any(self.node_index[u] >= self.sep_bw_idx for u in self._reachable_users(node))
+        """True if any transitive consumer of *node* is a real backward op.
+
+        Excludes the ``sep_backward`` marker itself, which is only a boundary
+        sentinel and should not count as a true activation use.
+        """
+        return any(
+            self.node_index[u] >= self.sep_bw_idx
+            and u.target is not torch.ops.separator.sep_backward.default
+            for u in self._reachable_users(node)
+        )
 
     def _register_activation(self, node: fx.Node) -> None:
         """Label *node* as ACT and record where its lifetime crosses regions.
@@ -354,7 +362,12 @@ class GraphProfiler(fx.Interpreter):
 
         reachable_users = self._reachable_users(node)
         fw_users = [u for u in reachable_users if self.node_index[u] < self.sep_bw_idx]
-        bw_users = [u for u in reachable_users if self.node_index[u] >= self.sep_bw_idx]
+        bw_users = [
+            u
+            for u in reachable_users
+            if self.node_index[u] >= self.sep_bw_idx
+            and u.target is not torch.ops.separator.sep_backward.default
+        ]
 
         self.last_fw_access[node] = (
             max(fw_users, key=lambda u: self.node_index[u]) if fw_users else None
@@ -480,10 +493,11 @@ class GraphProfiler(fx.Interpreter):
             elif nt is NodeType.ACT:
                 born = self.node_index[node]
                 fbw = self.first_bw_access.get(node)
-                if fbw is not None:
-                    dies = self.node_index[fbw]
-                else:
-                    dies = max((self.node_index[u] for u in node.users), default=born)
+                if fbw is None:
+                    raise RuntimeError(
+                        f"Invariant violation: ACT node {node.name} has no backward use"
+                    )
+                dies = self.node_index[fbw]
                 ranges[node] = (born, dies)
             else:
                 born = self.node_index[node]
