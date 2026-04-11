@@ -159,11 +159,15 @@ class GraphProfiler(fx.Interpreter):
         activation table, per-node profiling, peak-memory summary."""
         rule = "=" * 90
         print(f"\n{rule}\nGRAPH PROFILING RESULTS\n{rule}")
+        print("DEBUG_VERSION: graph_prof_debug_2026_04_11_v1")
 
         self._print_classification_summary()
+        self._print_boundary_debug()
+        self._print_activation_debug()
         self._print_activation_table()
         self._print_per_node_table()
         self._print_memory_summary()
+        self._print_memory_peak_debug()
 
         print(rule + "\n")
 
@@ -393,6 +397,57 @@ class GraphProfiler(fx.Interpreter):
         print(f"  {'FW candidates':14s}: {fw_candidates} nodes")
         print(f"  {'ACT(w/ BW use)':14s}: {checkpointable} nodes")
 
+    def _print_boundary_debug(self) -> None:
+        """Print boundary marker diagnostics for forward/loss/backward split."""
+        print("\n--- Boundary Debug ---")
+        print(f"  sep idx={self.sep_idx}, name={self.sep_node.name}")
+        print(f"  sep_backward idx={self.sep_bw_idx}, name={self.sep_backward_node.name}")
+
+        def _node_desc(idx: int) -> str:
+            if idx < 0 or idx >= len(self.node_list):
+                return "<out-of-range>"
+            n = self.node_list[idx]
+            return f"{idx}:{n.name} ({n.op})"
+
+        print("  Around sep:")
+        for i in range(self.sep_idx - 2, self.sep_idx + 3):
+            print(f"    {_node_desc(i)}")
+
+        print("  Around sep_backward:")
+        for i in range(self.sep_bw_idx - 2, self.sep_bw_idx + 3):
+            print(f"    {_node_desc(i)}")
+
+    def _print_activation_debug(self) -> None:
+        """Print ACT integrity diagnostics and suspicious cases."""
+        print("\n--- Activation Debug ---")
+        act_nodes = [n for n in self.node_list if self.node_type.get(n) is NodeType.ACT]
+        no_fbw = [n for n in act_nodes if self.first_bw_access.get(n) is None]
+        sep_fbw = [
+            n for n in act_nodes
+            if (self.first_bw_access.get(n) is not None
+                and self.first_bw_access[n].target is torch.ops.separator.sep_backward.default)
+        ]
+
+        print(f"  total ACT nodes: {len(act_nodes)}")
+        print(f"  ACT with no first_bw_access: {len(no_fbw)}")
+        print(f"  ACT with first_bw_access == sep_backward: {len(sep_fbw)}")
+
+        if no_fbw:
+            print("  sample ACT with no first_bw_access:")
+            for n in no_fbw[:20]:
+                print(f"    - {n.name}")
+
+        # Show a few FW candidates that failed backward reachability.
+        non_act_fw = [
+            n for n in self.node_list
+            if self._is_forward_candidate(n) and self.node_type.get(n) is not NodeType.ACT
+        ]
+        print(f"  FW candidates not labeled ACT: {len(non_act_fw)}")
+        if non_act_fw:
+            print("  sample FW candidates not ACT:")
+            for n in non_act_fw[:20]:
+                print(f"    - {n.name} ({n.op})")
+
     def _print_activation_table(self) -> None:
         """Print each intermediate activation with its memory size and liveness endpoints."""
         n = len(self.intermediate_nodes)
@@ -433,6 +488,68 @@ class GraphProfiler(fx.Interpreter):
         for nt in (NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPT, NodeType.OTHER):
             print(f"  {nt.name:8s}: {self._fmt_bytes(breakdown.get(nt, 0))}")
         print(f"  {'PEAK':8s}: {self._fmt_bytes(peak)}")
+
+    def _print_memory_peak_debug(self) -> None:
+        """Print detailed diagnostics for peak and ACT-specific memory behavior."""
+        print("\n--- Memory Peak Debug ---")
+        decomposed = self._find_decomposed_parents()
+        alive = self._build_alive_ranges(decomposed)
+
+        peak_step = -1
+        peak_total = 0
+        peak_by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+
+        max_act_step = -1
+        max_act_bytes = 0
+
+        for step in range(len(self.node_list)):
+            total = 0
+            by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+            for node, (born, dies) in alive.items():
+                if born <= step <= dies:
+                    sz = self.node_mem_bytes[node.name]
+                    total += sz
+                    by_type[self.node_type.get(node, NodeType.OTHER)] += sz
+
+            if total > peak_total:
+                peak_total = total
+                peak_step = step
+                peak_by_type = by_type
+
+            act_bytes = by_type.get(NodeType.ACT, 0)
+            if act_bytes > max_act_bytes:
+                max_act_bytes = act_bytes
+                max_act_step = step
+
+        peak_region = self.node_region.get(self.node_list[peak_step], "?") if peak_step >= 0 else "?"
+        max_act_region = self.node_region.get(self.node_list[max_act_step], "?") if max_act_step >= 0 else "?"
+
+        print(f"  peak step: {peak_step}, region: {peak_region}, total: {self._fmt_bytes(peak_total)}")
+        print(f"  peak ACT at any step: step {max_act_step}, region: {max_act_region}, ACT={self._fmt_bytes(max_act_bytes)}")
+        print(
+            "  breakdown at peak: "
+            f"PARAM={self._fmt_bytes(peak_by_type.get(NodeType.PARAM, 0))}, "
+            f"ACT={self._fmt_bytes(peak_by_type.get(NodeType.ACT, 0))}, "
+            f"GRAD={self._fmt_bytes(peak_by_type.get(NodeType.GRAD, 0))}, "
+            f"OPT={self._fmt_bytes(peak_by_type.get(NodeType.OPT, 0))}, "
+            f"OTHER={self._fmt_bytes(peak_by_type.get(NodeType.OTHER, 0))}"
+        )
+
+        if peak_step >= 0:
+            alive_at_peak: List[Tuple[int, str, str]] = []
+            for node, (born, dies) in alive.items():
+                if born <= peak_step <= dies:
+                    alive_at_peak.append(
+                        (
+                            self.node_mem_bytes[node.name],
+                            node.name,
+                            self.node_type.get(node, NodeType.OTHER).name,
+                        )
+                    )
+            alive_at_peak.sort(reverse=True)
+            print("  top alive tensors at peak (size, type, name):")
+            for sz, name, nt in alive_at_peak[:25]:
+                print(f"    - {self._fmt_bytes(sz):>10s} | {nt:5s} | {name}")
 
     # ------------------------------------------------------------------
     # Peak-memory analysis
