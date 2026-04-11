@@ -139,13 +139,8 @@ class Experiment:
                 graph_profiler.run(*args)
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
-            # TODO:test a 100 MB peak-memory target.
-            # plan = build_checkpoint_plan(
-            #     graph_profiler,
-            #     PolicyConfig(target_peak_memory_bytes=100 * 1024 * 1024),
-            # )
+            # Use the paper-aligned scheduler with its default peak-memory target.
             plan = build_checkpoint_plan(graph_profiler, PolicyConfig())
-            plan.print_summary(top_k=12)
 
             # Save peak-memory breakdown plot to ../plots/
             plots_dir = os.path.join(
