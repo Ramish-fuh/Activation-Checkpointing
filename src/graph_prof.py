@@ -198,6 +198,7 @@ class GraphProfiler(fx.Interpreter):
           - is this node before or after sep_backward?
           - is a consumer in the forward or backward region?
           - when is a tensor born and when is its last use?
+          - give all nodes numbered in topological order.
         """
         self.node_list: List[fx.Node] = list(self.module.graph.nodes)
         self.node_index: Dict[fx.Node, int] = {
@@ -205,7 +206,7 @@ class GraphProfiler(fx.Interpreter):
         }
 
     def _find_region_boundaries(self) -> None:
-        """Locate the two sentinel ops inserted by the tracer.
+        """Locate the two sentinel ops inserted by the tracer there are only two in the whole graph.
 
         ``sep``           -- marks the END   of the forward pass
         ``sep_backward``  -- marks the START of the backward pass
@@ -226,8 +227,9 @@ class GraphProfiler(fx.Interpreter):
         self.sep_idx:    int = self.node_index[self.sep_node]
         self.sep_bw_idx: int = self.node_index[self.sep_backward_node]
 
-    def _label_regions(self) -> None:
+    def _label_regions(self) -> None: 
         """Tag every node as 'forward', 'loss', or 'backward'.
+        main aim is to provide o(1) lookup for later passes that need to know which region a node belongs to.
 
         Uses the two separator indices as fences:
           idx <= sep_idx          -> forward
@@ -281,7 +283,7 @@ class GraphProfiler(fx.Interpreter):
             if node.target is not torch.ops.aten._fused_adam.default:
                 continue
 
-            self._collect_fx_nodes(node.args[0], self.param_nodes)
+            self._collect_fx_nodes(node.args[0], self.param_nodes) # _collect_fx_nodes is a helper that recursively walks nested struvtures
             self._collect_fx_nodes(node.args[1], self.grad_nodes)
             for i in range(2, min(5, len(node.args))):
                 self._collect_fx_nodes(node.args[i], self.optimizer_state_nodes)
