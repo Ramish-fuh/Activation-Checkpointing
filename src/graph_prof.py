@@ -640,9 +640,13 @@ class GraphProfiler(fx.Interpreter):
             nt = self.node_type.get(node, NodeType.OTHER)
             if nt is NodeType.PARAM:
                 ranges[node] = (0, last)
-            elif nt in (NodeType.GRAD, NodeType.OPT):
-                # Gradients / optimizer states are not meaningful forward activations.
-                # Model them as backward-resident to avoid inflating forward memory.
+            elif nt is NodeType.GRAD:
+                # Gradients materialize when their producer node executes
+                # (typically in backward), then persist until step end.
+                born = min(max(self.node_index[node], self.sep_bw_idx), last)
+                ranges[node] = (born, last)
+            elif nt is NodeType.OPT:
+                # Optimizer states are treated as backward-resident for peak accounting.
                 born = min(self.sep_bw_idx, last)
                 ranges[node] = (born, last)
             elif nt is NodeType.ACT:
@@ -1040,16 +1044,14 @@ class GraphProfiler(fx.Interpreter):
         grads_mb = [s.get(NodeType.GRAD, 0) / 1024**2 for s in by_type_series]
         feats_mb = [s.get(NodeType.ACT, 0) / 1024**2 for s in by_type_series]
 
-        # Match the diagnostic style where weights/gradients are shown as
-        # near-horizontal baselines across the full operation axis.
+        # Match the diagnostic style where weights are shown as a near-horizontal
+        # baseline across the full operation axis.
         w_level = max(weights_mb, default=0.0)
-        g_level = max(grads_mb, default=0.0)
         weights_line = [w_level] * len(op_counts)
-        grads_line = [g_level] * len(op_counts)
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 5))
         ax.plot(op_counts, weights_line, color="#1f77b4", linewidth=1.8, label="weights")
-        ax.plot(op_counts, grads_line, color="#ff7f0e", linewidth=1.8, label="gradients")
+        ax.step(op_counts, grads_mb, where="post", color="#ff7f0e", linewidth=1.8, label="gradients")
         ax.step(op_counts, feats_mb, where="post", color="#2ca02c", linewidth=1.8, label="feature maps")
         ax.axvline(self.sep_bw_idx + 1, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
 
