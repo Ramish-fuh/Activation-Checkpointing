@@ -606,6 +606,35 @@ class GraphProfiler(fx.Interpreter):
             if n.users and all(u.target is operator.getitem for u in n.users)
         }
 
+    def _collect_recompute_closure(self, target: fx.Node) -> Set[fx.Node]:
+        """Collect the forward-region nodes needed to recompute *target*.
+
+        This mirrors the dependency walk used by the checkpoint policy and is
+        used to mark temporary recompute dependencies as short-lived.
+        """
+        closure: Set[fx.Node] = set()
+        visited: Set[fx.Node] = set()
+
+        def visit(node: fx.Node) -> None:
+            if node in visited:
+                return
+            visited.add(node)
+
+            if self.node_region.get(node) != "forward":
+                return
+
+            nt = self.node_type.get(node, NodeType.OTHER)
+            if node.op == OP.PLACEHOLDER or nt is NodeType.PARAM:
+                closure.add(node)
+                return
+
+            closure.add(node)
+            for inp in node.all_input_nodes:
+                visit(inp)
+
+        visit(target)
+        return closure
+
     def _build_alive_ranges(
         self,
         decomposed: Set[fx.Node],
@@ -753,16 +782,49 @@ class GraphProfiler(fx.Interpreter):
         """Build alive ranges with checkpoint behavior accounted for.
 
         Retained activations keep their original liveness.
-        Recomputed activations are counted at first backward use only
-        (single-step residency), modeling immediate consume-and-release.
+
+        Nodes in a recompute closure are treated as temporary:
+        - the activation itself stays alive from first backward use through its
+          last backward consumer,
+        - intermediate recompute dependencies are only alive at the recompute
+          event and are released immediately after producing the recomputed node.
         """
         base_alive = self._build_alive_ranges(decomposed)
         adjusted: Dict[fx.Node, Tuple[int, int]] = {}
 
         retained_nodes = getattr(checkpoint_plan, "retained_nodes", set())
+        recompute_acts = getattr(checkpoint_plan, "recompute_nodes", set())
+        first_bw_use = getattr(checkpoint_plan, "first_backward_use", {})
+
+        temp_dep_step: Dict[fx.Node, int] = {}
+        act_live_ranges: Dict[fx.Node, Tuple[int, int]] = {}
+
+        for act in recompute_acts:
+            fbw = first_bw_use.get(act, self.first_bw_access.get(act))
+            if fbw is None:
+                continue
+            fbw_idx = self.node_index[fbw]
+            lbw = self.last_bw_access.get(act, fbw)
+            lbw_idx = self.node_index[lbw]
+            act_live_ranges[act] = (fbw_idx, lbw_idx)
+
+            for dep in self._collect_recompute_closure(act):
+                if dep is act or dep in retained_nodes:
+                    continue
+                if dep not in temp_dep_step or fbw_idx < temp_dep_step[dep]:
+                    temp_dep_step[dep] = fbw_idx
 
         for node, (born, dies) in base_alive.items():
             nt = self.node_type.get(node, NodeType.OTHER)
+            if node in act_live_ranges:
+                adjusted[node] = act_live_ranges[node]
+                continue
+
+            if node in temp_dep_step:
+                step = temp_dep_step[node]
+                adjusted[node] = (step, step)
+                continue
+
             if nt is not NodeType.ACT:
                 adjusted[node] = (born, dies)
                 continue
@@ -771,13 +833,13 @@ class GraphProfiler(fx.Interpreter):
                 adjusted[node] = (born, dies)
                 continue
 
+            # Unretained activations that are not explicit recompute targets are
+            # treated as single-use temporaries.
             fbw = self.first_bw_access.get(node)
-            lbw = self.last_bw_access.get(node)
-            if fbw is None or lbw is None:
+            if fbw is None:
                 continue
             fbw_idx = self.node_index[fbw]
-            lbw_idx = self.node_index[lbw]
-            adjusted[node] = (fbw_idx, lbw_idx)
+            adjusted[node] = (fbw_idx, fbw_idx)
 
         return adjusted
 
