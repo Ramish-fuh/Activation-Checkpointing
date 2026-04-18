@@ -189,6 +189,34 @@ class Experiment:
             except Exception as e:
                 print(f"Warning: could not save overall plot: {e}")
 
+            # Generate memory-over-time timeline against op id
+            save_path_timeline = os.path.join(
+                plots_dir,
+                f"memory_vs_opid_{self.model_name}_bs{self.batch_size}.png",
+            )
+            try:
+                graph_profiler.plot_memory_vs_opid(
+                    title=f"{self.model_name} (bs={self.batch_size})",
+                    save_path=save_path_timeline,
+                    checkpoint_plan=plan,
+                )
+            except Exception as e:
+                print(f"Warning: could not save memory-vs-opid plot: {e}")
+
+            # Generate phase-wise peak memory (forward/loss/backward)
+            save_path_phase = os.path.join(
+                plots_dir,
+                f"memory_by_phase_{self.model_name}_bs{self.batch_size}.png",
+            )
+            try:
+                graph_profiler.plot_phase_memory_summary(
+                    title=f"{self.model_name} (bs={self.batch_size})",
+                    save_path=save_path_phase,
+                    checkpoint_plan=plan,
+                )
+            except Exception as e:
+                print(f"Warning: could not save phase-memory plot: {e}")
+
         return gm
 
     def run(self):

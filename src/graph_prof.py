@@ -732,6 +732,62 @@ class GraphProfiler(fx.Interpreter):
             # else: skip recomputed activations (they don't live in forward with checkpoint)
         return filtered
 
+    def _build_alive_ranges_with_checkpoint(
+        self,
+        decomposed: Set[fx.Node],
+        checkpoint_plan: Any,
+    ) -> Dict[fx.Node, Tuple[int, int]]:
+        """Build alive ranges with checkpoint behavior accounted for.
+
+        Retained activations keep their original liveness.
+        Recomputed activations are counted at first backward use only
+        (single-step residency), modeling immediate consume-and-release.
+        """
+        base_alive = self._build_alive_ranges(decomposed)
+        adjusted: Dict[fx.Node, Tuple[int, int]] = {}
+
+        retained_nodes = getattr(checkpoint_plan, "retained_nodes", set())
+
+        for node, (born, dies) in base_alive.items():
+            nt = self.node_type.get(node, NodeType.OTHER)
+            if nt is not NodeType.ACT:
+                adjusted[node] = (born, dies)
+                continue
+
+            if node in retained_nodes:
+                adjusted[node] = (born, dies)
+                continue
+
+            fbw = self.first_bw_access.get(node)
+            if fbw is None:
+                continue
+            fbw_idx = self.node_index[fbw]
+            adjusted[node] = (fbw_idx, fbw_idx)
+
+        return adjusted
+
+    def _build_memory_timeline(
+        self,
+        alive: Dict[fx.Node, Tuple[int, int]],
+    ) -> Tuple[List[int], List[Dict[NodeType, int]], List[int]]:
+        """Return per-step memory timeline as (steps, by_type, totals)."""
+        steps = list(range(len(self.node_list)))
+        by_type_series: List[Dict[NodeType, int]] = []
+        totals: List[int] = []
+
+        for step in steps:
+            by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+            total = 0
+            for node, (born, dies) in alive.items():
+                if born <= step <= dies:
+                    sz = self.node_mem_bytes[node.name]
+                    total += sz
+                    by_type[self.node_type.get(node, NodeType.OTHER)] += sz
+            by_type_series.append(by_type)
+            totals.append(total)
+
+        return steps, by_type_series, totals
+
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
@@ -795,6 +851,139 @@ class GraphProfiler(fx.Interpreter):
             self._generate_single_plot(
                 breakdown_cp, peak_cp, plot_region, title, cp_save_path, "With Checkpoint"
             )
+
+    def plot_memory_vs_opid(
+        self,
+        title: str = "",
+        save_path: Optional[str] = None,
+        checkpoint_plan: Optional[Any] = None,
+    ) -> None:
+        """Plot memory-over-time against op id with region markers.
+
+        If ``checkpoint_plan`` is provided, overlays a checkpoint-aware
+        timeline where recomputed activations are materialized only at
+        first backward consumption and then released immediately.
+        """
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("WARNING: matplotlib not installed -- skipping memory-vs-opid plot")
+            return
+
+        if matplotlib.get_backend().lower() != "agg":
+            matplotlib.use("Agg", force=True)
+            import importlib
+            importlib.reload(plt)
+
+        decomposed = self._find_decomposed_parents()
+        alive_baseline = self._build_alive_ranges(decomposed)
+        steps, _, totals = self._build_memory_timeline(alive_baseline)
+
+        totals_mb = [v / 1024**2 for v in totals]
+        fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+        ax.plot(steps, totals_mb, linewidth=2.0, color="#1f77b4", label="Baseline")
+
+        if checkpoint_plan is not None:
+            alive_cp = self._build_alive_ranges_with_checkpoint(decomposed, checkpoint_plan)
+            _, _, totals_cp = self._build_memory_timeline(alive_cp)
+            totals_cp_mb = [v / 1024**2 for v in totals_cp]
+            ax.plot(
+                steps,
+                totals_cp_mb,
+                linewidth=2.0,
+                linestyle="--",
+                color="#d62728",
+                label="With Checkpoint",
+            )
+
+        ax.axvline(self.sep_idx, color="black", linestyle=":", linewidth=1.3, label="sep")
+        ax.axvline(self.sep_bw_idx, color="gray", linestyle=":", linewidth=1.3, label="sep_backward")
+
+        ax.set_xlabel("Op ID (topological index)")
+        ax.set_ylabel("Alive Memory (MB)")
+        ax.set_title(f"Memory vs Op ID{' -- ' + title if title else ''}")
+        ax.grid(alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved plot: {os.path.abspath(save_path)}")
+        else:
+            print("WARNING: no save_path -- plot not saved")
+        plt.close(fig)
+
+    def plot_phase_memory_summary(
+        self,
+        title: str = "",
+        save_path: Optional[str] = None,
+        checkpoint_plan: Optional[Any] = None,
+    ) -> None:
+        """Plot peak memory by execution phase (forward/loss/backward)."""
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("WARNING: matplotlib not installed -- skipping phase-memory plot")
+            return
+
+        if matplotlib.get_backend().lower() != "agg":
+            matplotlib.use("Agg", force=True)
+            import importlib
+            importlib.reload(plt)
+
+        def _phase_peaks(totals: List[int]) -> Dict[str, float]:
+            fw_end = min(self.sep_idx, len(totals) - 1)
+            loss_end = min(self.sep_bw_idx - 1, len(totals) - 1)
+
+            fw_peak = max(totals[: fw_end + 1], default=0)
+            loss_peak = max(totals[self.sep_idx + 1 : loss_end + 1], default=0)
+            bw_peak = max(totals[self.sep_bw_idx :], default=0)
+            return {
+                "Forward": fw_peak / 1024**2,
+                "Loss": loss_peak / 1024**2,
+                "Backward": bw_peak / 1024**2,
+            }
+
+        decomposed = self._find_decomposed_parents()
+        alive_baseline = self._build_alive_ranges(decomposed)
+        _, _, totals = self._build_memory_timeline(alive_baseline)
+        baseline = _phase_peaks(totals)
+
+        phases = ["Forward", "Loss", "Backward"]
+        x = list(range(len(phases)))
+        width = 0.38
+
+        fig, ax = plt.subplots(1, 1, figsize=(9, 5))
+        base_vals = [baseline[p] for p in phases]
+        ax.bar([i - width / 2 for i in x], base_vals, width, label="Baseline", color="#1f77b4")
+
+        if checkpoint_plan is not None:
+            alive_cp = self._build_alive_ranges_with_checkpoint(decomposed, checkpoint_plan)
+            _, _, totals_cp = self._build_memory_timeline(alive_cp)
+            cp = _phase_peaks(totals_cp)
+            cp_vals = [cp[p] for p in phases]
+            ax.bar([i + width / 2 for i in x], cp_vals, width, label="With Checkpoint", color="#d62728")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(phases)
+        ax.set_ylabel("Peak Memory in Phase (MB)")
+        ax.set_title(f"Memory by Pass Phase{' -- ' + title if title else ''}")
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved plot: {os.path.abspath(save_path)}")
+        else:
+            print("WARNING: no save_path -- plot not saved")
+        plt.close(fig)
 
     def compute_peak_memory_filtered(
         self,
