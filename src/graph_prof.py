@@ -891,31 +891,35 @@ class GraphProfiler(fx.Interpreter):
         alive_baseline = self._build_alive_ranges(decomposed)
         steps, _, totals = self._build_memory_timeline(alive_baseline)
 
+        op_counts = [s + 1 for s in steps]
         totals_mb = [v / 1024**2 for v in totals]
         fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-        ax.plot(steps, totals_mb, linewidth=2.0, color="#1f77b4", label="Baseline")
+        ax.step(op_counts, totals_mb, where="post", linewidth=2.0, color="#1f77b4", label="Baseline")
 
         if checkpoint_plan is not None:
             alive_cp = self._build_alive_ranges_with_checkpoint(decomposed, checkpoint_plan)
             _, _, totals_cp = self._build_memory_timeline(alive_cp)
             totals_cp_mb = [v / 1024**2 for v in totals_cp]
-            ax.plot(
-                steps,
+            ax.step(
+                op_counts,
                 totals_cp_mb,
+                where="post",
                 linewidth=2.0,
                 linestyle="--",
                 color="#d62728",
                 label="With Checkpoint",
             )
 
-        ax.axvline(self.sep_idx, color="black", linestyle=":", linewidth=1.3, label="sep")
-        ax.axvline(self.sep_bw_idx, color="gray", linestyle=":", linewidth=1.3, label="sep_backward")
+        ax.axvline(self.sep_idx + 1, color="black", linestyle=":", linewidth=1.3, label="sep")
+        ax.axvline(self.sep_bw_idx + 1, color="gray", linestyle=":", linewidth=1.3, label="sep_backward")
 
-        ax.set_xlabel("Op ID (topological index)")
+        ax.set_xlabel("Operations (count)")
         ax.set_ylabel("Alive Memory (MB)")
         ax.set_title(f"Memory vs Op ID{' -- ' + title if title else ''}")
         ax.grid(alpha=0.3)
         ax.legend()
+        if op_counts:
+            ax.set_xlim(1, op_counts[-1])
         plt.tight_layout()
 
         if save_path:
@@ -1031,15 +1035,23 @@ class GraphProfiler(fx.Interpreter):
             alive = self._build_alive_ranges_with_checkpoint(decomposed, checkpoint_plan)
 
         steps, by_type_series, _ = self._build_memory_timeline(alive)
+        op_counts = [s + 1 for s in steps]
         weights_mb = [s.get(NodeType.PARAM, 0) / 1024**2 for s in by_type_series]
         grads_mb = [s.get(NodeType.GRAD, 0) / 1024**2 for s in by_type_series]
         feats_mb = [s.get(NodeType.ACT, 0) / 1024**2 for s in by_type_series]
 
+        # Match the diagnostic style where weights/gradients are shown as
+        # near-horizontal baselines across the full operation axis.
+        w_level = max(weights_mb, default=0.0)
+        g_level = max(grads_mb, default=0.0)
+        weights_line = [w_level] * len(op_counts)
+        grads_line = [g_level] * len(op_counts)
+
         fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-        ax.plot(steps, weights_mb, color="#1f77b4", linewidth=1.8, label="weights")
-        ax.plot(steps, grads_mb, color="#ff7f0e", linewidth=1.8, label="gradients")
-        ax.plot(steps, feats_mb, color="#2ca02c", linewidth=1.8, label="feature maps")
-        ax.axvline(self.sep_bw_idx, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
+        ax.plot(op_counts, weights_line, color="#1f77b4", linewidth=1.8, label="weights")
+        ax.plot(op_counts, grads_line, color="#ff7f0e", linewidth=1.8, label="gradients")
+        ax.step(op_counts, feats_mb, where="post", color="#2ca02c", linewidth=1.8, label="feature maps")
+        ax.axvline(self.sep_bw_idx + 1, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
 
         ax.set_xlabel("operations")
         ax.set_ylabel("Memory (MB)")
@@ -1047,6 +1059,8 @@ class GraphProfiler(fx.Interpreter):
         ax.set_title(f"Memory Components vs Operations{suffix}{' -- ' + title if title else ''}")
         ax.grid(alpha=0.3)
         ax.legend()
+        if op_counts:
+            ax.set_xlim(1, op_counts[-1])
         plt.tight_layout()
 
         if save_path:
