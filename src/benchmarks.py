@@ -217,6 +217,33 @@ class Experiment:
             except Exception as e:
                 print(f"Warning: could not save phase-memory plot: {e}")
 
+            # Generate component timeline (weights / gradients / feature maps)
+            save_path_components = os.path.join(
+                plots_dir,
+                f"memory_components_{self.model_name}_bs{self.batch_size}.png",
+            )
+            try:
+                graph_profiler.plot_memory_components_vs_opid(
+                    title=f"{self.model_name} (bs={self.batch_size})",
+                    save_path=save_path_components,
+                    checkpoint_plan=None,
+                )
+            except Exception as e:
+                print(f"Warning: could not save component-memory plot: {e}")
+
+            save_path_components_cp = os.path.join(
+                plots_dir,
+                f"memory_components_{self.model_name}_bs{self.batch_size}_with_checkpoint.png",
+            )
+            try:
+                graph_profiler.plot_memory_components_vs_opid(
+                    title=f"{self.model_name} (bs={self.batch_size})",
+                    save_path=save_path_components_cp,
+                    checkpoint_plan=plan,
+                )
+            except Exception as e:
+                print(f"Warning: could not save component-memory checkpoint plot: {e}")
+
         return gm
 
     def run(self):

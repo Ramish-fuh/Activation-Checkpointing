@@ -985,6 +985,68 @@ class GraphProfiler(fx.Interpreter):
             print("WARNING: no save_path -- plot not saved")
         plt.close(fig)
 
+    def plot_memory_components_vs_opid(
+        self,
+        title: str = "",
+        save_path: Optional[str] = None,
+        checkpoint_plan: Optional[Any] = None,
+    ) -> None:
+        """Plot per-component memory against op id.
+
+        Components:
+        - weights   -> NodeType.PARAM
+        - gradients -> NodeType.GRAD
+        - feature maps -> NodeType.ACT
+
+        This view isolates feature-map liveness so forward rise / backward fall
+        is visible even when total memory is dominated by other tensor classes.
+        """
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("WARNING: matplotlib not installed -- skipping component-memory plot")
+            return
+
+        if matplotlib.get_backend().lower() != "agg":
+            matplotlib.use("Agg", force=True)
+            import importlib
+            importlib.reload(plt)
+
+        decomposed = self._find_decomposed_parents()
+        if checkpoint_plan is None:
+            alive = self._build_alive_ranges(decomposed)
+        else:
+            alive = self._build_alive_ranges_with_checkpoint(decomposed, checkpoint_plan)
+
+        steps, by_type_series, _ = self._build_memory_timeline(alive)
+        weights_mb = [s.get(NodeType.PARAM, 0) / 1024**2 for s in by_type_series]
+        grads_mb = [s.get(NodeType.GRAD, 0) / 1024**2 for s in by_type_series]
+        feats_mb = [s.get(NodeType.ACT, 0) / 1024**2 for s in by_type_series]
+
+        fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+        ax.plot(steps, weights_mb, color="#1f77b4", linewidth=1.8, label="weights")
+        ax.plot(steps, grads_mb, color="#ff7f0e", linewidth=1.8, label="gradients")
+        ax.plot(steps, feats_mb, color="#2ca02c", linewidth=1.8, label="feature maps")
+        ax.axvline(self.sep_idx, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
+
+        ax.set_xlabel("operations")
+        ax.set_ylabel("Memory (MB)")
+        suffix = " (with checkpoint)" if checkpoint_plan is not None else ""
+        ax.set_title(f"Memory Components vs Operations{suffix}{' -- ' + title if title else ''}")
+        ax.grid(alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved plot: {os.path.abspath(save_path)}")
+        else:
+            print("WARNING: no save_path -- plot not saved")
+        plt.close(fig)
+
     def compute_peak_memory_filtered(
         self,
         alive: Dict[fx.Node, Tuple[int, int]],
