@@ -310,6 +310,7 @@ class GraphProfiler(fx.Interpreter):
         self.intermediate_nodes: List[fx.Node]                    = []
         self.last_fw_access:     Dict[fx.Node, Optional[fx.Node]] = {}
         self.first_bw_access:    Dict[fx.Node, Optional[fx.Node]] = {}
+        self.last_bw_access:     Dict[fx.Node, Optional[fx.Node]] = {}
 
         for node in self.node_list:
             if node in self.param_nodes:
@@ -394,6 +395,9 @@ class GraphProfiler(fx.Interpreter):
         )
         self.first_bw_access[node] = (
             min(bw_users, key=lambda u: self.node_index[u]) if bw_users else None
+        )
+        self.last_bw_access[node] = (
+            max(bw_users, key=lambda u: self.node_index[u]) if bw_users else None
         )
 
     # ------------------------------------------------------------------
@@ -634,16 +638,21 @@ class GraphProfiler(fx.Interpreter):
                     continue
 
             nt = self.node_type.get(node, NodeType.OTHER)
-            if nt in (NodeType.PARAM, NodeType.GRAD, NodeType.OPT):
+            if nt is NodeType.PARAM:
                 ranges[node] = (0, last)
+            elif nt in (NodeType.GRAD, NodeType.OPT):
+                # Gradients / optimizer states are not meaningful forward activations.
+                # Model them as backward-resident to avoid inflating forward memory.
+                born = min(self.sep_bw_idx, last)
+                ranges[node] = (born, last)
             elif nt is NodeType.ACT:
                 born = self.node_index[node]
-                fbw = self.first_bw_access.get(node)
-                if fbw is None:
+                lbw = self.last_bw_access.get(node)
+                if lbw is None:
                     raise RuntimeError(
                         f"Invariant violation: ACT node {node.name} has no backward use"
                     )
-                dies = self.node_index[fbw]
+                dies = self.node_index[lbw]
                 ranges[node] = (born, dies)
             else:
                 born = self.node_index[node]
@@ -759,10 +768,12 @@ class GraphProfiler(fx.Interpreter):
                 continue
 
             fbw = self.first_bw_access.get(node)
-            if fbw is None:
+            lbw = self.last_bw_access.get(node)
+            if fbw is None or lbw is None:
                 continue
             fbw_idx = self.node_index[fbw]
-            adjusted[node] = (fbw_idx, fbw_idx)
+            lbw_idx = self.node_index[lbw]
+            adjusted[node] = (fbw_idx, lbw_idx)
 
         return adjusted
 
@@ -1028,7 +1039,7 @@ class GraphProfiler(fx.Interpreter):
         ax.plot(steps, weights_mb, color="#1f77b4", linewidth=1.8, label="weights")
         ax.plot(steps, grads_mb, color="#ff7f0e", linewidth=1.8, label="gradients")
         ax.plot(steps, feats_mb, color="#2ca02c", linewidth=1.8, label="feature maps")
-        ax.axvline(self.sep_idx, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
+        ax.axvline(self.sep_bw_idx, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
 
         ax.set_xlabel("operations")
         ax.set_ylabel("Memory (MB)")
