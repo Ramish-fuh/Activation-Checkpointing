@@ -144,7 +144,18 @@ class Experiment:
                 graph_profiler.run(*args)
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
+
+            # Let policy select checkpoint set automatically (no hard budget).
             plan = build_checkpoint_plan(graph_profiler, PolicyConfig())
+
+            print(
+                "Checkpoint plan summary: "
+                f"recompute_nodes={len(plan.recompute_nodes)}, "
+                f"saved={plan.estimated_memory_saved_bytes / 1024**2:.1f} MB, "
+                f"peak_before={plan.estimated_peak_before_bytes / 1024**2:.1f} MB, "
+                f"peak_after={plan.estimated_peak_after_bytes / 1024**2:.1f} MB, "
+                f"memory_limit={plan.memory_limit_bytes / 1024**2:.1f} MB"
+            )
 
             plots_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), '..', 'plots'

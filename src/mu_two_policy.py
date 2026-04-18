@@ -78,15 +78,18 @@ def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> L
 def _select_recompute_nodes(
     graph_profiler: Any,
     candidates: List[CandidateRow],
-    memory_limit_bytes: int,
-    estimated_peak_before: int,
     retained: Set[Any],
     recompute: Set[Any],
     first_bw_use: Dict[Any, Any],
     required_inputs_map: Dict[Any, Set[Any]],
 ) -> Tuple[int, float]:
-    selected_mem_bytes = 0
-    selected_recompute_ms = 0.0
+    """Choose recompute set automatically via a Pareto-style prefix objective.
+
+    Orders candidates by memory-per-recompute-ms, then chooses the prefix that
+    maximizes normalized gain: memory_fraction - time_fraction.
+    """
+    if not candidates:
+        return 0, 0.0
 
     ordered = sorted(
         candidates,
@@ -98,18 +101,37 @@ def _select_recompute_nodes(
         reverse=True,
     )
 
-    for row in ordered:
-        current_peak_after_selection = max(0, estimated_peak_before - selected_mem_bytes)
-        selected = current_peak_after_selection > memory_limit_bytes
+    total_mem = sum(max(0, row.mem) for row in ordered)
+    total_time = sum(max(0.0, row.recompute_time_ms) for row in ordered)
+    if total_mem <= 0:
+        return 0, 0.0
 
-        if selected:
-            selected_mem_bytes += row.mem
-            recompute.add(row.node)
-            retained.discard(row.node)
-            selected_recompute_ms += row.recompute_time_ms
-            if row.fbw_node is not None:
-                first_bw_use[row.node] = row.fbw_node
-                required_inputs_map[row.node] = set(row.req_inputs)
+    best_k = 0
+    best_score = float("-inf")
+    cum_mem = 0
+    cum_time = 0.0
+
+    for i, row in enumerate(ordered, start=1):
+        cum_mem += max(0, row.mem)
+        cum_time += max(0.0, row.recompute_time_ms)
+        mem_frac = cum_mem / total_mem
+        time_frac = (cum_time / total_time) if total_time > 0 else 0.0
+        score = mem_frac - time_frac
+        if score > best_score:
+            best_score = score
+            best_k = i
+
+    selected_mem_bytes = 0
+    selected_recompute_ms = 0.0
+    for row in ordered[:best_k]:
+        selected_mem_bytes += row.mem
+        recompute.add(row.node)
+        retained.discard(row.node)
+        selected_recompute_ms += row.recompute_time_ms
+        if row.fbw_node is not None:
+            first_bw_use[row.node] = row.fbw_node
+            required_inputs_map[row.node] = set(row.req_inputs)
+
     return selected_mem_bytes, selected_recompute_ms
 
 
@@ -200,21 +222,19 @@ def build_checkpoint_plan(
     required_inputs_map: Dict[Any, Set[Any]] = {}
 
     estimated_peak_before, _ = graph_profiler.compute_peak_memory()
-    memory_limit_bytes = config.memory_limit_bytes
-    if memory_limit_bytes is None:
-        memory_limit_bytes = int(estimated_peak_before * 0.75)
-
     candidates = _collect_policy_candidates(graph_profiler, activations)
     selected_mem_bytes, selected_recompute_ms = _select_recompute_nodes(
         graph_profiler=graph_profiler,
         candidates=candidates,
-        memory_limit_bytes=memory_limit_bytes,
-        estimated_peak_before=estimated_peak_before,
         retained=retained,
         recompute=recompute,
         first_bw_use=first_bw_use,
         required_inputs_map=required_inputs_map,
     )
+
+    # Report the implied memory target after algorithmic selection.
+    memory_limit_bytes = max(0, estimated_peak_before - selected_mem_bytes)
+
     estimated_peak_after = max(0, estimated_peak_before - selected_mem_bytes)
     return CheckpointPlan(
         retained_nodes=retained,
