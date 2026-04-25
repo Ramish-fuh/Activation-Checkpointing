@@ -1078,6 +1078,7 @@ class GraphProfiler(fx.Interpreter):
         - weights   -> NodeType.PARAM
         - gradients -> NodeType.GRAD
         - feature maps -> NodeType.ACT
+        - other tensors -> NodeType.OTHER
 
         This view isolates feature-map liveness so forward rise / backward fall
         is visible even when total memory is dominated by other tensor classes.
@@ -1105,6 +1106,7 @@ class GraphProfiler(fx.Interpreter):
         weights_mb = [s.get(NodeType.PARAM, 0) / 1024**2 for s in by_type_series]
         grads_mb = [s.get(NodeType.GRAD, 0) / 1024**2 for s in by_type_series]
         feats_mb = [s.get(NodeType.ACT, 0) / 1024**2 for s in by_type_series]
+        other_mb = [s.get(NodeType.OTHER, 0) / 1024**2 for s in by_type_series]
 
         # Match the diagnostic style where weights are shown as a near-horizontal
         # baseline across the full operation axis.
@@ -1115,6 +1117,7 @@ class GraphProfiler(fx.Interpreter):
         ax.plot(op_counts, weights_line, color="#1f77b4", linewidth=1.8, label="weights")
         ax.step(op_counts, grads_mb, where="post", color="#ff7f0e", linewidth=1.8, label="gradients")
         ax.step(op_counts, feats_mb, where="post", color="#2ca02c", linewidth=1.8, label="feature maps")
+        ax.step(op_counts, other_mb, where="post", color="#9467bd", linewidth=1.8, label="other")
         ax.axvline(self.sep_bw_idx + 1, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
 
         ax.set_xlabel("operations")

@@ -10,6 +10,10 @@ from graph_prof import NodeType
 @dataclass
 class PolicyConfig:
     memory_limit_bytes: Optional[int] = None
+    max_simulation_candidates: int = 64
+    max_selection_steps: int = 16
+    min_candidate_mem_bytes: int = 1 * 1024 * 1024
+    knee_utility_ratio: float = 0.2
 
 
 @dataclass
@@ -81,6 +85,7 @@ def _simulate_peak_with_recompute_set(
     all_activations: Set[Any],
     recompute_set: Set[Any],
     first_bw_use: Dict[Any, Any],
+    decomposed: Set[Any],
 ) -> int:
     """Return simulated peak memory for a proposed recompute set.
 
@@ -93,7 +98,6 @@ def _simulate_peak_with_recompute_set(
         first_backward_use=dict(first_bw_use),
     )
 
-    decomposed = graph_profiler._find_decomposed_parents()
     alive_with_cp = graph_profiler._build_alive_ranges_with_checkpoint(
         decomposed,
         checkpoint_plan,
@@ -109,6 +113,7 @@ def _select_recompute_nodes(
     recompute: Set[Any],
     first_bw_use: Dict[Any, Any],
     required_inputs_map: Dict[Any, Set[Any]],
+    config: PolicyConfig,
 ) -> Tuple[int, float, int]:
     """Choose recompute set via iterative marginal peak-reduction utility.
 
@@ -120,15 +125,33 @@ def _select_recompute_nodes(
     if not candidates:
         return 0, 0.0, estimated_peak_before
 
+    usable = [row for row in candidates if row.mem >= max(0, config.min_candidate_mem_bytes)]
+    if not usable:
+        return 0, 0.0, estimated_peak_before
+
+    ordered = sorted(
+        usable,
+        key=lambda row: (
+            row.mem / max(row.recompute_time_ms, 1e-6),
+            row.mem,
+            -graph_profiler.node_index.get(row.node, 0),
+        ),
+        reverse=True,
+    )
+    if config.max_simulation_candidates > 0:
+        ordered = ordered[: config.max_simulation_candidates]
+
     all_activations = set(retained)
-    remaining: List[CandidateRow] = list(candidates)
+    remaining: List[CandidateRow] = list(ordered)
+    decomposed = graph_profiler._find_decomposed_parents()
 
     current_peak = int(estimated_peak_before)
     selected_recompute_ms = 0.0
     selected_peak_drop = 0
     accepted_utilities: List[float] = []
+    selected_steps = 0
 
-    while remaining:
+    while remaining and (config.max_selection_steps <= 0 or selected_steps < config.max_selection_steps):
         best_row: Optional[CandidateRow] = None
         best_trial_peak = current_peak
         best_trial_first_bw: Dict[Any, Any] = {}
@@ -148,6 +171,7 @@ def _select_recompute_nodes(
                 all_activations=all_activations,
                 recompute_set=trial_recompute,
                 first_bw_use=trial_first_bw,
+                decomposed=decomposed,
             )
 
             delta_peak = current_peak - trial_peak
@@ -180,7 +204,7 @@ def _select_recompute_nodes(
         # Automatic diminishing-returns stop (knee-like behavior).
         if accepted_utilities:
             baseline_utility = accepted_utilities[0]
-            if baseline_utility > 0.0 and best_utility < 0.2 * baseline_utility:
+            if baseline_utility > 0.0 and best_utility < config.knee_utility_ratio * baseline_utility:
                 break
 
         recompute.add(best_row.node)
@@ -196,6 +220,7 @@ def _select_recompute_nodes(
         selected_peak_drop = int(estimated_peak_before) - int(current_peak)
         accepted_utilities.append(best_utility)
         remaining = [row for row in remaining if row.node is not best_row.node]
+        selected_steps += 1
 
     return max(0, selected_peak_drop), selected_recompute_ms, int(current_peak)
 
@@ -295,6 +320,7 @@ def build_checkpoint_plan(
         recompute=recompute,
         first_bw_use=first_bw_use,
         required_inputs_map=required_inputs_map,
+        config=config,
     )
 
     # Report the implied memory target after algorithmic selection.
