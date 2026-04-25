@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from graph_prof import NodeType
@@ -75,6 +76,32 @@ def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> L
     return candidates
 
 
+def _simulate_peak_with_recompute_set(
+    graph_profiler: Any,
+    all_activations: Set[Any],
+    recompute_set: Set[Any],
+    first_bw_use: Dict[Any, Any],
+) -> int:
+    """Return simulated peak memory for a proposed recompute set.
+
+    This uses GraphProfiler's checkpoint-aware lifetime model so selection is
+    driven by true peak reduction rather than summed activation sizes.
+    """
+    checkpoint_plan = SimpleNamespace(
+        retained_nodes=set(all_activations) - set(recompute_set),
+        recompute_nodes=set(recompute_set),
+        first_backward_use=dict(first_bw_use),
+    )
+
+    decomposed = graph_profiler._find_decomposed_parents()
+    alive_with_cp = graph_profiler._build_alive_ranges_with_checkpoint(
+        decomposed,
+        checkpoint_plan,
+    )
+    peak_after, _ = graph_profiler.compute_peak_memory_filtered(alive_with_cp)
+    return int(peak_after)
+
+
 def _select_recompute_nodes(
     graph_profiler: Any,
     candidates: List[CandidateRow],
@@ -82,57 +109,95 @@ def _select_recompute_nodes(
     recompute: Set[Any],
     first_bw_use: Dict[Any, Any],
     required_inputs_map: Dict[Any, Set[Any]],
-) -> Tuple[int, float]:
-    """Choose recompute set automatically via a Pareto-style prefix objective.
+) -> Tuple[int, float, int]:
+    """Choose recompute set via iterative marginal peak-reduction utility.
 
-    Orders candidates by memory-per-recompute-ms, then chooses the prefix that
-    maximizes normalized gain: memory_fraction - time_fraction.
+    At each iteration, evaluate each remaining candidate by simulating the
+    checkpoint-aware peak and selecting the candidate with best
+    ``delta_peak / recompute_time_ms``.
     """
+    estimated_peak_before, _ = graph_profiler.compute_peak_memory()
     if not candidates:
-        return 0, 0.0
+        return 0, 0.0, estimated_peak_before
 
-    ordered = sorted(
-        candidates,
-        key=lambda row: (
-            row.mem / max(row.recompute_time_ms, 1e-6),
-            row.mem,
-            -graph_profiler.node_index.get(row.node, 0),
-        ),
-        reverse=True,
-    )
+    all_activations = set(retained)
+    remaining: List[CandidateRow] = list(candidates)
 
-    total_mem = sum(max(0, row.mem) for row in ordered)
-    total_time = sum(max(0.0, row.recompute_time_ms) for row in ordered)
-    if total_mem <= 0:
-        return 0, 0.0
-
-    best_k = 0
-    best_score = float("-inf")
-    cum_mem = 0
-    cum_time = 0.0
-
-    for i, row in enumerate(ordered, start=1):
-        cum_mem += max(0, row.mem)
-        cum_time += max(0.0, row.recompute_time_ms)
-        mem_frac = cum_mem / total_mem
-        time_frac = (cum_time / total_time) if total_time > 0 else 0.0
-        score = mem_frac - time_frac
-        if score > best_score:
-            best_score = score
-            best_k = i
-
-    selected_mem_bytes = 0
+    current_peak = int(estimated_peak_before)
     selected_recompute_ms = 0.0
-    for row in ordered[:best_k]:
-        selected_mem_bytes += row.mem
-        recompute.add(row.node)
-        retained.discard(row.node)
-        selected_recompute_ms += row.recompute_time_ms
-        if row.fbw_node is not None:
-            first_bw_use[row.node] = row.fbw_node
-            required_inputs_map[row.node] = set(row.req_inputs)
+    selected_peak_drop = 0
+    accepted_utilities: List[float] = []
 
-    return selected_mem_bytes, selected_recompute_ms
+    while remaining:
+        best_row: Optional[CandidateRow] = None
+        best_trial_peak = current_peak
+        best_trial_first_bw: Dict[Any, Any] = {}
+        best_delta_peak = 0
+        best_utility = float("-inf")
+
+        for row in remaining:
+            trial_recompute = set(recompute)
+            trial_recompute.add(row.node)
+
+            trial_first_bw = dict(first_bw_use)
+            if row.fbw_node is not None:
+                trial_first_bw[row.node] = row.fbw_node
+
+            trial_peak = _simulate_peak_with_recompute_set(
+                graph_profiler=graph_profiler,
+                all_activations=all_activations,
+                recompute_set=trial_recompute,
+                first_bw_use=trial_first_bw,
+            )
+
+            delta_peak = current_peak - trial_peak
+            if delta_peak <= 0:
+                continue
+
+            utility = float(delta_peak) / max(row.recompute_time_ms, 1e-6)
+            if (
+                utility > best_utility
+                or (
+                    utility == best_utility
+                    and (
+                        delta_peak > best_delta_peak
+                        or (
+                            delta_peak == best_delta_peak
+                            and row.mem > (best_row.mem if best_row is not None else -1)
+                        )
+                    )
+                )
+            ):
+                best_row = row
+                best_trial_peak = trial_peak
+                best_trial_first_bw = trial_first_bw
+                best_delta_peak = delta_peak
+                best_utility = utility
+
+        if best_row is None:
+            break
+
+        # Automatic diminishing-returns stop (knee-like behavior).
+        if accepted_utilities:
+            baseline_utility = accepted_utilities[0]
+            if baseline_utility > 0.0 and best_utility < 0.2 * baseline_utility:
+                break
+
+        recompute.add(best_row.node)
+        retained.discard(best_row.node)
+        selected_recompute_ms += best_row.recompute_time_ms
+
+        if best_row.fbw_node is not None:
+            first_bw_use.clear()
+            first_bw_use.update(best_trial_first_bw)
+        required_inputs_map[best_row.node] = set(best_row.req_inputs)
+
+        current_peak = best_trial_peak
+        selected_peak_drop = int(estimated_peak_before) - int(current_peak)
+        accepted_utilities.append(best_utility)
+        remaining = [row for row in remaining if row.node is not best_row.node]
+
+    return max(0, selected_peak_drop), selected_recompute_ms, int(current_peak)
 
 
 def _estimate_recompute_metrics(
@@ -223,7 +288,7 @@ def build_checkpoint_plan(
 
     estimated_peak_before, _ = graph_profiler.compute_peak_memory()
     candidates = _collect_policy_candidates(graph_profiler, activations)
-    selected_mem_bytes, selected_recompute_ms = _select_recompute_nodes(
+    selected_mem_bytes, selected_recompute_ms, estimated_peak_after = _select_recompute_nodes(
         graph_profiler=graph_profiler,
         candidates=candidates,
         retained=retained,
@@ -233,9 +298,7 @@ def build_checkpoint_plan(
     )
 
     # Report the implied memory target after algorithmic selection.
-    memory_limit_bytes = max(0, estimated_peak_before - selected_mem_bytes)
-
-    estimated_peak_after = max(0, estimated_peak_before - selected_mem_bytes)
+    memory_limit_bytes = max(0, estimated_peak_after)
     return CheckpointPlan(
         retained_nodes=retained,
         recompute_nodes=recompute,
