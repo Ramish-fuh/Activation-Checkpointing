@@ -1174,6 +1174,7 @@ class GraphProfiler(fx.Interpreter):
         grads_mb = [s.get(NodeType.GRAD, 0) / 1024**2 for s in by_type_series]
         feats_mb = [s.get(NodeType.ACT, 0) / 1024**2 for s in by_type_series]
         other_mb = [s.get(NodeType.OTHER, 0) / 1024**2 for s in by_type_series]
+        total_mb = [sum(series.values()) / 1024**2 for series in by_type_series]
 
         # Match the diagnostic style where weights are shown as a near-horizontal
         # baseline across the full operation axis.
@@ -1185,6 +1186,7 @@ class GraphProfiler(fx.Interpreter):
         ax.step(op_counts, grads_mb, where="post", color="#ff7f0e", linewidth=1.8, label="gradients")
         ax.step(op_counts, feats_mb, where="post", color="#2ca02c", linewidth=1.8, label="feature maps")
         ax.step(op_counts, other_mb, where="post", color="#9467bd", linewidth=1.8, label="other")
+        ax.step(op_counts, total_mb, where="post", color="black", linewidth=2.2, linestyle="--", label="total alive")
         ax.axvline(self.sep_bw_idx + 1, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
 
         ax.set_xlabel("operations")
