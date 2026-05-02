@@ -71,6 +71,7 @@ class PlanValidationReport:
     retained_nodes: int
     recompute_nodes: int
     min_candidate_mem_bytes: int
+    excluded_param_only_candidates: int
     optimize_region: str
     estimated_peak_delta_bytes: int
     largest_candidates: List[Dict[str, Any]]
@@ -89,6 +90,7 @@ class PlanValidationReport:
             "retained_nodes": self.retained_nodes,
             "recompute_nodes": self.recompute_nodes,
             "min_candidate_mem_bytes": self.min_candidate_mem_bytes,
+            "excluded_param_only_candidates": self.excluded_param_only_candidates,
             "optimize_region": self.optimize_region,
             "estimated_peak_delta_bytes": self.estimated_peak_delta_bytes,
             "largest_candidates": self.largest_candidates,
@@ -103,6 +105,7 @@ class PlanValidationReport:
             f"  checkpointable_activations={self.checkpointable_activations}",
             f"  eligible_candidates={self.eligible_candidates} "
             f"(min={_fmt_bytes(self.min_candidate_mem_bytes)})",
+            f"  excluded_param_only_candidates={self.excluded_param_only_candidates}",
             f"  optimize_region={self.optimize_region}",
             f"  retained_nodes={self.retained_nodes}",
             f"  recompute_nodes={self.recompute_nodes}",
@@ -142,6 +145,18 @@ def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> L
             )
         )
     return candidates
+
+
+def _is_param_only_candidate(graph_profiler: Any, row: CandidateRow) -> bool:
+    """True when recomputing the target depends only on model parameters.
+
+    Such targets are usually parameter views/transposes, not mini-batch
+    activations. Checkpointing them would not represent activation memory
+    savings and can produce misleading plans.
+    """
+    if not row.req_inputs:
+        return False
+    return all(graph_profiler.node_type.get(inp) == NodeType.PARAM for inp in row.req_inputs)
 
 
 def _compute_peak_from_alive(
@@ -217,7 +232,12 @@ def _select_recompute_nodes(
     if not candidates:
         return 0, 0.0, estimated_peak_before
 
-    usable = [row for row in candidates if row.mem >= max(0, config.min_candidate_mem_bytes)]
+    usable = [
+        row
+        for row in candidates
+        if row.mem >= max(0, config.min_candidate_mem_bytes)
+        and not _is_param_only_candidate(graph_profiler, row)
+    ]
     if not usable:
         return 0, 0.0, estimated_peak_before
 
@@ -405,10 +425,16 @@ def validate_checkpoint_plan(
         if graph_profiler.first_bw_access.get(n) is not None
     ]
     min_candidate_mem = max(0, int(config.min_candidate_mem_bytes))
+    candidate_rows = _collect_policy_candidates(graph_profiler, activations)
+    excluded_param_only = sum(
+        1
+        for row in candidate_rows
+        if row.mem >= min_candidate_mem and _is_param_only_candidate(graph_profiler, row)
+    )
     eligible = [
-        n
-        for n in activations
-        if int(graph_profiler.node_mem_bytes.get(n.name, 0)) >= min_candidate_mem
+        row.node
+        for row in candidate_rows
+        if row.mem >= min_candidate_mem and not _is_param_only_candidate(graph_profiler, row)
     ]
     largest_candidates = [
         {
@@ -507,6 +533,20 @@ def validate_checkpoint_plan(
             "Policy selected recompute nodes but estimated peak memory did not decrease"
         )
 
+    param_only_recompute = [
+        node.name
+        for node in recompute
+        if all(
+            graph_profiler.node_type.get(inp) == NodeType.PARAM
+            for inp in plan.required_recompute_inputs.get(node, set())
+        )
+    ]
+    if param_only_recompute:
+        warnings.append(
+            "Plan selected parameter-only recompute targets: "
+            + ", ".join(sorted(param_only_recompute)[:10])
+        )
+
     if int(plan.estimated_memory_saved_bytes) != estimated_peak_delta:
         warnings.append(
             "Plan saved-bytes summary does not match peak_before - peak_after"
@@ -518,6 +558,7 @@ def validate_checkpoint_plan(
         retained_nodes=len(retained),
         recompute_nodes=len(recompute),
         min_candidate_mem_bytes=min_candidate_mem,
+        excluded_param_only_candidates=excluded_param_only,
         optimize_region=optimize_region,
         estimated_peak_delta_bytes=estimated_peak_delta,
         largest_candidates=largest_candidates,
