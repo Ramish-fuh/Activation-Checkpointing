@@ -10,12 +10,12 @@ from graph_prof import NodeType
 @dataclass
 class PolicyConfig:
     memory_limit_bytes: Optional[int] = None
+    default_memory_budget_fraction: float = 0.5
     optimize_region: str = "forward"
     reject_overall_peak_increase: bool = True
     max_simulation_candidates: int = 64
     max_selection_steps: int = 16
     min_candidate_mem_bytes: int = 1 * 1024 * 1024
-    knee_utility_ratio: float = 0.2
 
 
 @dataclass
@@ -76,6 +76,8 @@ class PlanValidationReport:
     excluded_alias_candidates: int
     optimize_region: str
     estimated_peak_delta_bytes: int
+    memory_limit_bytes: Optional[int]
+    memory_budget_satisfied: Optional[bool]
     forward_peak_before_bytes: int
     forward_peak_after_bytes: int
     overall_peak_before_bytes: int
@@ -100,6 +102,8 @@ class PlanValidationReport:
             "excluded_alias_candidates": self.excluded_alias_candidates,
             "optimize_region": self.optimize_region,
             "estimated_peak_delta_bytes": self.estimated_peak_delta_bytes,
+            "memory_limit_bytes": self.memory_limit_bytes,
+            "memory_budget_satisfied": self.memory_budget_satisfied,
             "forward_peak_before_bytes": self.forward_peak_before_bytes,
             "forward_peak_after_bytes": self.forward_peak_after_bytes,
             "overall_peak_before_bytes": self.overall_peak_before_bytes,
@@ -122,6 +126,9 @@ class PlanValidationReport:
             f"  retained_nodes={self.retained_nodes}",
             f"  recompute_nodes={self.recompute_nodes}",
             f"  estimated_peak_delta={_fmt_bytes(max(0, self.estimated_peak_delta_bytes))}",
+            f"  memory_limit="
+            f"{_fmt_bytes(self.memory_limit_bytes) if self.memory_limit_bytes is not None else 'None'}",
+            f"  memory_budget_satisfied={self.memory_budget_satisfied}",
             f"  forward_peak={_fmt_bytes(self.forward_peak_before_bytes)} -> "
             f"{_fmt_bytes(self.forward_peak_after_bytes)}",
             f"  overall_peak={_fmt_bytes(self.overall_peak_before_bytes)} -> "
@@ -222,6 +229,15 @@ def _compute_peak_from_alive(
     )
 
 
+def _resolve_memory_limit_bytes(baseline_peak_bytes: int, config: PolicyConfig) -> int:
+    """Return the target peak used by the budget-driven policy loop."""
+    if config.memory_limit_bytes is not None:
+        return max(0, int(config.memory_limit_bytes))
+
+    fraction = max(0.0, min(1.0, float(config.default_memory_budget_fraction)))
+    return int(baseline_peak_bytes * fraction)
+
+
 def _build_alive_with_recompute_set(
     graph_profiler: Any,
     all_activations: Set[Any],
@@ -276,12 +292,12 @@ def _select_recompute_nodes(
     first_bw_use: Dict[Any, Any],
     required_inputs_map: Dict[Any, Set[Any]],
     config: PolicyConfig,
-) -> Tuple[int, float, int]:
-    """Choose recompute set via iterative marginal peak-reduction utility.
+) -> Tuple[int, float, int, int]:
+    """Choose recompute set with a budget-driven greedy policy.
 
-    At each iteration, evaluate each remaining candidate by simulating the
-    checkpoint-aware peak and selecting the candidate with best
-    ``delta_peak / recompute_time_ms``.
+    The loop keeps selecting the candidate with best marginal
+    ``delta_peak / recompute_time_ms`` until the configured memory budget is
+    met or no remaining candidate can reduce the simulated peak.
     """
     decomposed = graph_profiler._find_decomposed_parents()
     baseline_alive = graph_profiler._build_alive_ranges(decomposed)
@@ -295,8 +311,9 @@ def _select_recompute_nodes(
         baseline_alive,
         "overall",
     )
+    memory_limit_bytes = _resolve_memory_limit_bytes(estimated_peak_before, config)
     if not candidates:
-        return 0, 0.0, estimated_peak_before
+        return 0, 0.0, estimated_peak_before, memory_limit_bytes
 
     usable = [
         row
@@ -306,7 +323,7 @@ def _select_recompute_nodes(
         and not _is_alias_candidate(graph_profiler, row)
     ]
     if not usable:
-        return 0, 0.0, estimated_peak_before
+        return 0, 0.0, estimated_peak_before, memory_limit_bytes
 
     ordered = sorted(
         usable,
@@ -326,10 +343,13 @@ def _select_recompute_nodes(
     current_peak = int(estimated_peak_before)
     selected_recompute_ms = 0.0
     selected_peak_drop = 0
-    accepted_utilities: List[float] = []
     selected_steps = 0
 
-    while remaining and (config.max_selection_steps <= 0 or selected_steps < config.max_selection_steps):
+    while (
+        current_peak > memory_limit_bytes
+        and remaining
+        and (config.max_selection_steps <= 0 or selected_steps < config.max_selection_steps)
+    ):
         best_row: Optional[CandidateRow] = None
         best_trial_peak = current_peak
         best_trial_first_bw: Dict[Any, Any] = {}
@@ -400,12 +420,6 @@ def _select_recompute_nodes(
         if best_row is None:
             break
 
-        # Automatic diminishing-returns stop (knee-like behavior).
-        if accepted_utilities:
-            baseline_utility = accepted_utilities[0]
-            if baseline_utility > 0.0 and best_utility < config.knee_utility_ratio * baseline_utility:
-                break
-
         recompute.add(best_row.node)
         retained.discard(best_row.node)
         selected_recompute_ms += best_trial_recompute_ms
@@ -417,7 +431,6 @@ def _select_recompute_nodes(
 
         current_peak = best_trial_peak
         selected_peak_drop = int(estimated_peak_before) - int(current_peak)
-        accepted_utilities.append(best_utility)
         remaining = [row for row in remaining if row.node is not best_row.node]
         selected_steps += 1
 
@@ -433,7 +446,7 @@ def _select_recompute_nodes(
             required_inputs_map[node] = req_inputs
             selected_recompute_ms += recompute_time_ms
 
-    return max(0, selected_peak_drop), selected_recompute_ms, int(current_peak)
+    return max(0, selected_peak_drop), selected_recompute_ms, int(current_peak), memory_limit_bytes
 
 
 def _estimate_recompute_metrics(
@@ -648,6 +661,10 @@ def validate_checkpoint_plan(
     optimize_region = getattr(plan, "optimize_region", config.optimize_region)
     peak_before = int(plan.estimated_peak_before_bytes or 0)
     peak_after = int(plan.estimated_peak_after_bytes or 0)
+    memory_limit = plan.memory_limit_bytes
+    memory_budget_satisfied = (
+        None if memory_limit is None else peak_after <= int(memory_limit)
+    )
     estimated_peak_delta = max(0, peak_before - peak_after)
 
     decomposed = graph_profiler._find_decomposed_parents()
@@ -675,6 +692,11 @@ def validate_checkpoint_plan(
     if overall_peak_after > overall_peak_before:
         warnings.append(
             "Plan reduces the selected region but increases overall peak memory"
+        )
+
+    if memory_budget_satisfied is False:
+        warnings.append(
+            "Policy could not reach the configured memory budget with the eligible candidates"
         )
 
     param_only_recompute = [
@@ -706,6 +728,8 @@ def validate_checkpoint_plan(
         excluded_alias_candidates=excluded_alias,
         optimize_region=optimize_region,
         estimated_peak_delta_bytes=estimated_peak_delta,
+        memory_limit_bytes=memory_limit,
+        memory_budget_satisfied=memory_budget_satisfied,
         forward_peak_before_bytes=forward_peak_before,
         forward_peak_after_bytes=forward_peak_after,
         overall_peak_before_bytes=overall_peak_before,
@@ -736,7 +760,12 @@ def build_checkpoint_plan(
     required_inputs_map: Dict[Any, Set[Any]] = {}
 
     candidates = _collect_policy_candidates(graph_profiler, activations)
-    selected_mem_bytes, selected_recompute_ms, estimated_peak_after = _select_recompute_nodes(
+    (
+        selected_mem_bytes,
+        selected_recompute_ms,
+        estimated_peak_after,
+        memory_limit_bytes,
+    ) = _select_recompute_nodes(
         graph_profiler=graph_profiler,
         candidates=candidates,
         retained=retained,
@@ -747,8 +776,6 @@ def build_checkpoint_plan(
     )
     estimated_peak_before = estimated_peak_after + selected_mem_bytes
 
-    # Report the implied memory target for the selected optimization region.
-    memory_limit_bytes = max(0, estimated_peak_after)
     return CheckpointPlan(
         retained_nodes=retained,
         recompute_nodes=recompute,
