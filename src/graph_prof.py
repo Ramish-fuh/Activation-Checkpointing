@@ -298,10 +298,10 @@ class GraphProfiler(fx.Interpreter):
     def _classify_nodes(self) -> None:
         """Assign ``NodeType`` to every node; build intermediate-activation list.
 
-        A node is an *intermediate activation* when:
+        A node is a saved intermediate activation when:
           1. It lives in the forward region
           2. It is not a placeholder or output
-          3. It has at least one consumer in the backward region
+          3. It has at least one direct consumer in the backward region
 
         For each activation we record ``last_fw_access`` and ``first_bw_access``
         -- the endpoints of its liveness window.
@@ -333,44 +333,27 @@ class GraphProfiler(fx.Interpreter):
         )
 
     def _activation_use_sets(self, node: fx.Node) -> Tuple[Set[fx.Node], Set[fx.Node]]:
-        """Return forward-closure users and true backward consumers for activation logic.
+        """Return direct forward users and direct backward consumers.
 
-        Crucially, this traversal does NOT walk through the loss region
-        (``sep_idx < idx < sep_bw_idx``), which prevents false dependencies
-        through the loss-seeding chain (e.g. ones_like -> sep_backward).
+        Backward consumers must be direct users of ``node``. A transitive walk
+        through forward descendants would make most activations appear to be
+        first used by the loss backward op, which is not the saved-tensor
+        dependency needed for checkpoint placement.
         """
-        forward_reachable: Set[fx.Node] = set()
+        forward_users: Set[fx.Node] = set()
         backward_consumers: Set[fx.Node] = set()
 
-        stack: List[fx.Node] = [node]
-        seen_forward: Set[fx.Node] = {node}
+        for user in node.users:
+            u_idx = self.node_index[user]
+            if u_idx < self.sep_idx:
+                forward_users.add(user)
+            elif u_idx >= self.sep_bw_idx and user.target is not torch.ops.separator.sep_backward.default:
+                backward_consumers.add(user)
 
-        while stack:
-            cur = stack.pop()
-            for user in cur.users:
-                u_idx = self.node_index[user]
-
-                # Forward region: continue traversal.
-                if u_idx < self.sep_idx:
-                    forward_reachable.add(user)
-                    if user not in seen_forward:
-                        seen_forward.add(user)
-                        stack.append(user)
-                    continue
-
-                # Backward region: treat as real backward use unless it is the marker.
-                if u_idx >= self.sep_bw_idx:
-                    if user.target is not torch.ops.separator.sep_backward.default:
-                        backward_consumers.add(user)
-                    continue
-
-                # Loss region (between sep and sep_backward): ignore this path.
-                # It should not establish activation dependency for checkpointing.
-
-        return forward_reachable, backward_consumers
+        return forward_users, backward_consumers
 
     def _has_backward_reachability(self, node: fx.Node) -> bool:
-        """True if any transitive consumer of *node* is a real backward op.
+        """True if any direct consumer of *node* is a real backward op.
 
         Excludes the ``sep_backward`` marker itself, which is only a boundary
         sentinel and should not count as a true activation use.
