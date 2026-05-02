@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import torch.fx as fx
 from torchvision.models import resnet152
 from graph_prof import GraphProfiler
-from mu_two_policy import build_checkpoint_plan, PolicyConfig
+from mu_two_policy import build_checkpoint_plan, PolicyConfig, validate_checkpoint_plan
 from graph_tracer import SEPFunction, compile
 
 try:
@@ -146,7 +146,9 @@ class Experiment:
             graph_profiler.print_stats()
 
             # Let policy select checkpoint set automatically (no hard budget).
-            plan = build_checkpoint_plan(graph_profiler, PolicyConfig())
+            policy_config = PolicyConfig()
+            plan = build_checkpoint_plan(graph_profiler, policy_config)
+            validation = validate_checkpoint_plan(graph_profiler, plan, policy_config)
 
             print(
                 "Checkpoint plan summary: "
@@ -156,6 +158,7 @@ class Experiment:
                 f"peak_after={plan.estimated_peak_after_bytes / 1024**2:.1f} MB, "
                 f"memory_limit={plan.memory_limit_bytes / 1024**2:.1f} MB"
             )
+            print(validation.format_summary())
 
             plots_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), '..', 'plots'
@@ -167,7 +170,9 @@ class Experiment:
                 f"checkpoint_plan_{self.model_name}_bs{self.batch_size}.json",
             )
             with open(plan_path, "w", encoding="utf-8") as f:
-                json.dump(plan.to_dict(), f, indent=2)
+                plan_payload = plan.to_dict()
+                plan_payload["validation"] = validation.to_dict()
+                json.dump(plan_payload, f, indent=2)
             print(f"Saved plan: {os.path.abspath(plan_path)}")
 
             # Generate forward-only peak plot (with checkpoint comparison)

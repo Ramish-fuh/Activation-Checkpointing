@@ -59,6 +59,64 @@ class CandidateRow:
     req_inputs: Set[Any]
 
 
+@dataclass
+class PlanValidationReport:
+    """Human-readable diagnostics for a policy-generated checkpoint plan."""
+
+    checkpointable_activations: int
+    eligible_candidates: int
+    retained_nodes: int
+    recompute_nodes: int
+    min_candidate_mem_bytes: int
+    estimated_peak_delta_bytes: int
+    largest_candidates: List[Dict[str, Any]]
+    errors: List[str]
+    warnings: List[str]
+
+    @property
+    def ok(self) -> bool:
+        return len(self.errors) == 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "checkpointable_activations": self.checkpointable_activations,
+            "eligible_candidates": self.eligible_candidates,
+            "retained_nodes": self.retained_nodes,
+            "recompute_nodes": self.recompute_nodes,
+            "min_candidate_mem_bytes": self.min_candidate_mem_bytes,
+            "estimated_peak_delta_bytes": self.estimated_peak_delta_bytes,
+            "largest_candidates": self.largest_candidates,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+        }
+
+    def format_summary(self) -> str:
+        lines = [
+            "Checkpoint plan validation:",
+            f"  ok={self.ok}",
+            f"  checkpointable_activations={self.checkpointable_activations}",
+            f"  eligible_candidates={self.eligible_candidates} "
+            f"(min={_fmt_bytes(self.min_candidate_mem_bytes)})",
+            f"  retained_nodes={self.retained_nodes}",
+            f"  recompute_nodes={self.recompute_nodes}",
+            f"  estimated_peak_delta={_fmt_bytes(max(0, self.estimated_peak_delta_bytes))}",
+        ]
+        if self.largest_candidates:
+            lines.append("  largest_candidates:")
+            for row in self.largest_candidates[:5]:
+                lines.append(f"    - {row['name']}: {_fmt_bytes(row['memory_bytes'])}")
+        if self.warnings:
+            lines.append("  warnings:")
+            for warning in self.warnings:
+                lines.append(f"    - {warning}")
+        if self.errors:
+            lines.append("  errors:")
+            for error in self.errors:
+                lines.append(f"    - {error}")
+        return "\n".join(lines)
+
+
 def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> List[CandidateRow]:
     """Build per-activation candidate rows used by the scheduler."""
 
@@ -290,6 +348,146 @@ def _fmt_bytes(b: int) -> str:
         if b >= threshold:
             return f"{b / threshold:.1f} {unit}"
     return f"{b} B"
+
+
+def validate_checkpoint_plan(
+    graph_profiler: Any,
+    plan: CheckpointPlan,
+    config: Optional[PolicyConfig] = None,
+) -> PlanValidationReport:
+    """Validate whether a checkpoint plan is implementable by the graph rewriter.
+
+    This is intentionally diagnostic rather than fatal: the benchmark prints the
+    report so we can distinguish "no useful checkpoint candidates" from "the
+    planner emitted a malformed plan".
+    """
+    config = config or PolicyConfig()
+    _validate_profiler_contract(graph_profiler)
+
+    graph_nodes = set(graph_profiler.node_list)
+    activations = [
+        n
+        for n in graph_profiler.intermediate_nodes
+        if graph_profiler.first_bw_access.get(n) is not None
+    ]
+    min_candidate_mem = max(0, int(config.min_candidate_mem_bytes))
+    eligible = [
+        n
+        for n in activations
+        if int(graph_profiler.node_mem_bytes.get(n.name, 0)) >= min_candidate_mem
+    ]
+    largest_candidates = [
+        {
+            "name": n.name,
+            "memory_bytes": int(graph_profiler.node_mem_bytes.get(n.name, 0)),
+            "first_backward_use": (
+                graph_profiler.first_bw_access[n].name
+                if graph_profiler.first_bw_access.get(n) is not None
+                else None
+            ),
+        }
+        for n in sorted(
+            activations,
+            key=lambda node: int(graph_profiler.node_mem_bytes.get(node.name, 0)),
+            reverse=True,
+        )[:10]
+    ]
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    retained = set(plan.retained_nodes)
+    recompute = set(plan.recompute_nodes)
+
+    overlap = retained & recompute
+    if overlap:
+        overlap_names = sorted(n.name for n in overlap if hasattr(n, "name"))
+        errors.append(
+            "Nodes appear in both retained_nodes and recompute_nodes: "
+            + ", ".join(overlap_names[:10])
+        )
+
+    for node in sorted(recompute, key=lambda n: graph_profiler.node_index.get(n, 10**9)):
+        if node not in graph_nodes:
+            errors.append(f"Recompute target {node.name} is not in the graph")
+            continue
+
+        if graph_profiler.node_type.get(node) != NodeType.ACT:
+            errors.append(f"Recompute target {node.name} is not classified as ACT")
+
+        mem = int(graph_profiler.node_mem_bytes.get(node.name, 0))
+        if mem <= 0:
+            warnings.append(f"Recompute target {node.name} has zero measured output memory")
+
+        fbw = plan.first_backward_use.get(node)
+        if fbw is None:
+            errors.append(f"Recompute target {node.name} has no first_backward_use")
+        elif fbw not in graph_nodes:
+            errors.append(f"first_backward_use for {node.name} is not in the graph")
+        elif graph_profiler.node_index[fbw] < graph_profiler.sep_bw_idx:
+            errors.append(
+                f"first_backward_use for {node.name} occurs before the backward region"
+            )
+
+        required_inputs = plan.required_recompute_inputs.get(node)
+        if not required_inputs:
+            errors.append(f"Recompute target {node.name} has no required_recompute_inputs")
+            continue
+
+        invalid_inputs: List[str] = []
+        for inp in required_inputs:
+            inp_type = graph_profiler.node_type.get(inp, NodeType.OTHER)
+            allowed = (
+                inp in graph_nodes
+                and (
+                    inp.op == "placeholder"
+                    or inp_type == NodeType.PARAM
+                    or inp in retained
+                )
+            )
+            if not allowed:
+                invalid_inputs.append(
+                    f"{getattr(inp, 'name', repr(inp))}:{getattr(inp_type, 'name', inp_type)}"
+                )
+        if invalid_inputs:
+            errors.append(
+                f"Recompute target {node.name} has invalid boundary inputs: "
+                + ", ".join(invalid_inputs[:10])
+            )
+
+    peak_before = int(plan.estimated_peak_before_bytes or 0)
+    peak_after = int(plan.estimated_peak_after_bytes or 0)
+    estimated_peak_delta = max(0, peak_before - peak_after)
+
+    if not recompute:
+        if eligible:
+            warnings.append(
+                "Policy selected no recompute nodes even though eligible activation candidates exist"
+            )
+        else:
+            warnings.append(
+                "Policy selected no recompute nodes because no activation candidates met the size threshold"
+            )
+    elif estimated_peak_delta <= 0:
+        warnings.append(
+            "Policy selected recompute nodes but estimated peak memory did not decrease"
+        )
+
+    if int(plan.estimated_memory_saved_bytes) != estimated_peak_delta:
+        warnings.append(
+            "Plan saved-bytes summary does not match peak_before - peak_after"
+        )
+
+    return PlanValidationReport(
+        checkpointable_activations=len(activations),
+        eligible_candidates=len(eligible),
+        retained_nodes=len(retained),
+        recompute_nodes=len(recompute),
+        min_candidate_mem_bytes=min_candidate_mem,
+        estimated_peak_delta_bytes=estimated_peak_delta,
+        largest_candidates=largest_candidates,
+        errors=errors,
+        warnings=warnings,
+    )
 
 
 def build_checkpoint_plan(
