@@ -10,6 +10,7 @@
 import os
 import sys
 import json
+import copy
 from typing import Any, Dict, List
 
 import torch
@@ -20,6 +21,7 @@ import torch.fx as fx
 from torchvision.models import resnet152
 from graph_prof import GraphProfiler
 from mu_two_policy import build_checkpoint_plan, PolicyConfig, validate_checkpoint_plan
+from activation_checkpoint import apply_checkpoint_plan, smoke_check_graph
 from graph_tracer import SEPFunction, compile
 
 try:
@@ -149,6 +151,12 @@ class Experiment:
             policy_config = PolicyConfig()
             plan = build_checkpoint_plan(graph_profiler, policy_config)
             validation = validate_checkpoint_plan(graph_profiler, plan, policy_config)
+            rewrite_status = {
+                "attempted": False,
+                "applied": False,
+                "error": "",
+                "reason": "",
+            }
 
             print(
                 "Checkpoint plan summary: "
@@ -173,6 +181,7 @@ class Experiment:
             with open(plan_path, "w", encoding="utf-8") as f:
                 plan_payload = plan.to_dict()
                 plan_payload["validation"] = validation.to_dict()
+                plan_payload["rewrite_status"] = rewrite_status
                 json.dump(plan_payload, f, indent=2)
             print(f"Saved plan: {os.path.abspath(plan_path)}")
 
@@ -260,6 +269,42 @@ class Experiment:
                 )
             except Exception as e:
                 print(f"Warning: could not save component-memory checkpoint plot: {e}")
+
+            if not validation.ok:
+                rewrite_status["reason"] = "validation failed"
+            elif not plan.recompute_nodes:
+                rewrite_status["reason"] = "plan selected no recompute nodes"
+            else:
+                rewrite_status["attempted"] = True
+                try:
+                    candidate_gm = copy.deepcopy(gm)
+                    candidate_gm = apply_checkpoint_plan(candidate_gm, plan)
+                    ok, error = smoke_check_graph(candidate_gm, args)
+                    if ok:
+                        gm = candidate_gm
+                        rewrite_status["applied"] = True
+                        rewrite_status["reason"] = "rewrite smoke check passed"
+                        print("Checkpoint rewrite applied to FX graph.")
+                    else:
+                        rewrite_status["error"] = error
+                        rewrite_status["reason"] = "rewrite smoke check failed"
+                        print(
+                            "Warning: checkpoint rewrite failed smoke check; "
+                            f"returning original graph. Error: {error}"
+                        )
+                except Exception as e:
+                    rewrite_status["error"] = repr(e)
+                    rewrite_status["reason"] = "rewrite raised exception"
+                    print(
+                        "Warning: checkpoint rewrite raised an exception; "
+                        f"returning original graph. Error: {e}"
+                    )
+
+            with open(plan_path, "w", encoding="utf-8") as f:
+                plan_payload = plan.to_dict()
+                plan_payload["validation"] = validation.to_dict()
+                plan_payload["rewrite_status"] = rewrite_status
+                json.dump(plan_payload, f, indent=2)
 
         return gm
 

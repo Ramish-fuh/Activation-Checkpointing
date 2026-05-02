@@ -134,7 +134,10 @@ class GraphProfiler(fx.Interpreter):
         self.node_runtimes[n.name].append(start_evt.elapsed_time(end_evt))
 
         if n.name not in self.node_mem_bytes:
-            self.node_mem_bytes[n.name] = self._tensor_bytes(result)
+            if self._is_alias_node(n):
+                self.node_mem_bytes[n.name] = 0
+            else:
+                self.node_mem_bytes[n.name] = self._tensor_bytes(result)
 
         return result
 
@@ -301,7 +304,7 @@ class GraphProfiler(fx.Interpreter):
         A node is a saved intermediate activation when:
           1. It lives in the forward region
           2. It is not a placeholder or output
-          3. It has at least one direct consumer in the backward region
+          3. It has at least one direct or alias-only consumer in the backward region
 
         For each activation we record ``last_fw_access`` and ``first_bw_access``
         -- the endpoints of its liveness window.
@@ -330,25 +333,79 @@ class GraphProfiler(fx.Interpreter):
             self.node_index[node] < self.sep_idx
             and node.op not in (OP.PLACEHOLDER, OP.OUTPUT)
             and node.target is not torch.ops.separator.sep.default
+            and not self._is_alias_node(node)
         )
 
-    def _activation_use_sets(self, node: fx.Node) -> Tuple[Set[fx.Node], Set[fx.Node]]:
-        """Return direct forward users and direct backward consumers.
+    def _is_alias_node(self, node: fx.Node) -> bool:
+        """True for view-like ops that share storage with another tensor.
 
-        Backward consumers must be direct users of ``node``. A transitive walk
-        through forward descendants would make most activations appear to be
-        first used by the loss backward op, which is not the saved-tensor
-        dependency needed for checkpoint placement.
+        These nodes can carry saved-tensor edges into backward, but their
+        output does not own a fresh activation buffer. We follow them when
+        finding backward consumers, then count memory on the real producer.
+        """
+        target_name = str(node.target)
+        alias_markers = (
+            "aten.view.",
+            "aten._unsafe_view.",
+            "aten.t.",
+            "aten.transpose.",
+            "aten.permute.",
+            "aten.expand.",
+            "aten.squeeze.",
+            "aten.unsqueeze.",
+            "aten.slice.",
+            "aten.select.",
+            "aten.as_strided.",
+            "aten.detach.",
+            "aten.alias.",
+        )
+        if any(marker in target_name for marker in alias_markers):
+            return True
+
+        if node.op == OP.CALL_METHOD and node.target in {
+            "view",
+            "t",
+            "transpose",
+            "permute",
+            "expand",
+            "squeeze",
+            "unsqueeze",
+            "slice",
+            "select",
+            "detach",
+        }:
+            return True
+
+        return False
+
+    def _activation_use_sets(self, node: fx.Node) -> Tuple[Set[fx.Node], Set[fx.Node]]:
+        """Return direct forward users and alias-only backward consumers.
+
+        Backward consumers may be reached through view-like alias nodes, because
+        autograd can save a view while the actual storage belongs to the view's
+        producer. We deliberately do not walk through real forward compute ops;
+        doing so would make most activations appear to be first used by the loss
+        backward op instead of by their saved-tensor consumer.
         """
         forward_users: Set[fx.Node] = set()
         backward_consumers: Set[fx.Node] = set()
+        seen_alias_users: Set[fx.Node] = set()
 
-        for user in node.users:
+        def visit_user(user: fx.Node) -> None:
+            if user in seen_alias_users:
+                return
+            seen_alias_users.add(user)
             u_idx = self.node_index[user]
             if u_idx < self.sep_idx:
                 forward_users.add(user)
+                if self._is_alias_node(user):
+                    for alias_user in user.users:
+                        visit_user(alias_user)
             elif u_idx >= self.sep_bw_idx and user.target is not torch.ops.separator.sep_backward.default:
                 backward_consumers.add(user)
+
+        for user in node.users:
+            visit_user(user)
 
         return forward_users, backward_consumers
 
