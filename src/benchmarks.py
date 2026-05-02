@@ -279,7 +279,7 @@ class Experiment:
                 try:
                     candidate_gm = copy.deepcopy(gm)
                     candidate_gm = apply_checkpoint_plan(candidate_gm, plan)
-                    ok, error = smoke_check_graph(candidate_gm, args)
+                    ok, error = smoke_check_graph(candidate_gm, args, reference_gm=gm)
                     if ok:
                         gm = candidate_gm
                         rewrite_status["applied"] = True

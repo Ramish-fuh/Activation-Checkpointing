@@ -4,7 +4,7 @@ import inspect
 import torch
 import torch.nn as nn
 import torch.fx as fx
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
 from graph_tracer import SEPFunction
@@ -178,7 +178,84 @@ def clone_graph_inputs(args: Iterable[Any]) -> List[Any]:
     return cloned_args
 
 
-def smoke_check_graph(gm: fx.GraphModule, args: Iterable[Any]) -> Tuple[bool, str]:
+def _rng_state() -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    cuda_states: List[torch.Tensor] = []
+    if torch.cuda.is_available():
+        cuda_states = torch.cuda.get_rng_state_all()
+    return torch.random.get_rng_state(), cuda_states
+
+
+def _restore_rng_state(state: Tuple[torch.Tensor, List[torch.Tensor]]) -> None:
+    cpu_state, cuda_states = state
+    torch.random.set_rng_state(cpu_state)
+    if cuda_states and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _outputs_close(
+    expected: Any,
+    actual: Any,
+    *,
+    rtol: float,
+    atol: float,
+    path: str = "output",
+) -> Tuple[bool, str]:
+    if isinstance(expected, torch.Tensor) and isinstance(actual, torch.Tensor):
+        if expected.shape != actual.shape:
+            return False, f"{path} shape mismatch: {expected.shape} != {actual.shape}"
+        if expected.dtype != actual.dtype:
+            return False, f"{path} dtype mismatch: {expected.dtype} != {actual.dtype}"
+        if expected.is_floating_point() or expected.is_complex():
+            if not torch.allclose(expected, actual, rtol=rtol, atol=atol, equal_nan=True):
+                diff = (expected - actual).abs().max().item()
+                return False, f"{path} values differ; max abs diff={diff}"
+        elif not torch.equal(expected, actual):
+            return False, f"{path} values differ"
+        return True, ""
+
+    if isinstance(expected, (list, tuple)) and isinstance(actual, type(expected)):
+        if len(expected) != len(actual):
+            return False, f"{path} length mismatch: {len(expected)} != {len(actual)}"
+        for idx, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            ok, error = _outputs_close(
+                expected_item,
+                actual_item,
+                rtol=rtol,
+                atol=atol,
+                path=f"{path}[{idx}]",
+            )
+            if not ok:
+                return ok, error
+        return True, ""
+
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        if expected.keys() != actual.keys():
+            return False, f"{path} keys differ"
+        for key in expected:
+            ok, error = _outputs_close(
+                expected[key],
+                actual[key],
+                rtol=rtol,
+                atol=atol,
+                path=f"{path}[{key!r}]",
+            )
+            if not ok:
+                return ok, error
+        return True, ""
+
+    if expected != actual:
+        return False, f"{path} differs: {expected!r} != {actual!r}"
+    return True, ""
+
+
+def smoke_check_graph(
+    gm: fx.GraphModule,
+    args: Iterable[Any],
+    reference_gm: Optional[fx.GraphModule] = None,
+    *,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> Tuple[bool, str]:
     """Run a transformed graph once on cloned inputs.
 
     This is deliberately a smoke test, not a numerical proof. It catches the
@@ -186,6 +263,15 @@ def smoke_check_graph(gm: fx.GraphModule, args: Iterable[Any]) -> Tuple[bool, st
     the modified graph.
     """
     try:
+        if reference_gm is not None:
+            state = _rng_state()
+            with torch.no_grad():
+                expected = reference_gm(*clone_graph_inputs(args))
+            _restore_rng_state(state)
+            with torch.no_grad():
+                actual = gm(*clone_graph_inputs(args))
+            return _outputs_close(expected, actual, rtol=rtol, atol=atol)
+
         with torch.no_grad():
             gm(*clone_graph_inputs(args))
     except Exception as exc:
