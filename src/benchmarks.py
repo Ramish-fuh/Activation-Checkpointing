@@ -152,6 +152,7 @@ class Experiment:
 
             print(
                 "Checkpoint plan summary: "
+                f"region={plan.optimize_region}, "
                 f"recompute_nodes={len(plan.recompute_nodes)}, "
                 f"saved={plan.estimated_memory_saved_bytes / 1024**2:.1f} MB, "
                 f"peak_before={plan.estimated_peak_before_bytes / 1024**2:.1f} MB, "

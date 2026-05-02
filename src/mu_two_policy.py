@@ -10,6 +10,7 @@ from graph_prof import NodeType
 @dataclass
 class PolicyConfig:
     memory_limit_bytes: Optional[int] = None
+    optimize_region: str = "forward"
     max_simulation_candidates: int = 64
     max_selection_steps: int = 16
     min_candidate_mem_bytes: int = 1 * 1024 * 1024
@@ -29,6 +30,7 @@ class CheckpointPlan:
     estimated_peak_before_bytes: Optional[int] = None
     estimated_peak_after_bytes: Optional[int] = None
     memory_limit_bytes: Optional[int] = None
+    optimize_region: str = "forward"
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the plan without raw FX node objects for later analysis."""
@@ -47,6 +49,7 @@ class CheckpointPlan:
             "estimated_peak_before_bytes": self.estimated_peak_before_bytes,
             "estimated_peak_after_bytes": self.estimated_peak_after_bytes,
             "memory_limit_bytes": self.memory_limit_bytes,
+            "optimize_region": self.optimize_region,
         }
 
 
@@ -68,6 +71,7 @@ class PlanValidationReport:
     retained_nodes: int
     recompute_nodes: int
     min_candidate_mem_bytes: int
+    optimize_region: str
     estimated_peak_delta_bytes: int
     largest_candidates: List[Dict[str, Any]]
     errors: List[str]
@@ -85,6 +89,7 @@ class PlanValidationReport:
             "retained_nodes": self.retained_nodes,
             "recompute_nodes": self.recompute_nodes,
             "min_candidate_mem_bytes": self.min_candidate_mem_bytes,
+            "optimize_region": self.optimize_region,
             "estimated_peak_delta_bytes": self.estimated_peak_delta_bytes,
             "largest_candidates": self.largest_candidates,
             "errors": list(self.errors),
@@ -98,6 +103,7 @@ class PlanValidationReport:
             f"  checkpointable_activations={self.checkpointable_activations}",
             f"  eligible_candidates={self.eligible_candidates} "
             f"(min={_fmt_bytes(self.min_candidate_mem_bytes)})",
+            f"  optimize_region={self.optimize_region}",
             f"  retained_nodes={self.retained_nodes}",
             f"  recompute_nodes={self.recompute_nodes}",
             f"  estimated_peak_delta={_fmt_bytes(max(0, self.estimated_peak_delta_bytes))}",
@@ -138,17 +144,40 @@ def _collect_policy_candidates(graph_profiler: Any, activations: List[Any]) -> L
     return candidates
 
 
+def _compute_peak_from_alive(
+    graph_profiler: Any,
+    alive: Dict[Any, Tuple[int, int]],
+    optimize_region: str,
+) -> int:
+    """Compute peak bytes in the policy's selected optimization region."""
+
+    if optimize_region == "overall":
+        peak, _ = graph_profiler.compute_peak_memory_filtered(alive)
+        return int(peak)
+
+    if optimize_region == "forward":
+        _, peak, _ = graph_profiler._sweep_for_forward_peak(alive)
+        return int(peak)
+
+    raise ValueError(
+        f"Unsupported optimize_region={optimize_region!r}; expected 'forward' or 'overall'"
+    )
+
+
 def _simulate_peak_with_recompute_set(
     graph_profiler: Any,
     all_activations: Set[Any],
     recompute_set: Set[Any],
     first_bw_use: Dict[Any, Any],
     decomposed: Set[Any],
+    optimize_region: str,
 ) -> int:
     """Return simulated peak memory for a proposed recompute set.
 
-    This uses GraphProfiler's checkpoint-aware lifetime model so selection is
-    driven by true peak reduction rather than summed activation sizes.
+    This uses GraphProfiler's checkpoint-aware lifetime model, then measures
+    peak in the configured region. For this project, the default is the forward
+    activation-bearing region because optimizer/gradient peaks can otherwise
+    hide checkpointing's effect.
     """
     checkpoint_plan = SimpleNamespace(
         retained_nodes=set(all_activations) - set(recompute_set),
@@ -160,8 +189,7 @@ def _simulate_peak_with_recompute_set(
         decomposed,
         checkpoint_plan,
     )
-    peak_after, _ = graph_profiler.compute_peak_memory_filtered(alive_with_cp)
-    return int(peak_after)
+    return _compute_peak_from_alive(graph_profiler, alive_with_cp, optimize_region)
 
 
 def _select_recompute_nodes(
@@ -179,7 +207,13 @@ def _select_recompute_nodes(
     checkpoint-aware peak and selecting the candidate with best
     ``delta_peak / recompute_time_ms``.
     """
-    estimated_peak_before, _ = graph_profiler.compute_peak_memory()
+    decomposed = graph_profiler._find_decomposed_parents()
+    baseline_alive = graph_profiler._build_alive_ranges(decomposed)
+    estimated_peak_before = _compute_peak_from_alive(
+        graph_profiler,
+        baseline_alive,
+        config.optimize_region,
+    )
     if not candidates:
         return 0, 0.0, estimated_peak_before
 
@@ -201,7 +235,6 @@ def _select_recompute_nodes(
 
     all_activations = set(retained)
     remaining: List[CandidateRow] = list(ordered)
-    decomposed = graph_profiler._find_decomposed_parents()
 
     current_peak = int(estimated_peak_before)
     selected_recompute_ms = 0.0
@@ -230,6 +263,7 @@ def _select_recompute_nodes(
                 recompute_set=trial_recompute,
                 first_bw_use=trial_first_bw,
                 decomposed=decomposed,
+                optimize_region=config.optimize_region,
             )
 
             delta_peak = current_peak - trial_peak
@@ -454,6 +488,7 @@ def validate_checkpoint_plan(
                 + ", ".join(invalid_inputs[:10])
             )
 
+    optimize_region = getattr(plan, "optimize_region", config.optimize_region)
     peak_before = int(plan.estimated_peak_before_bytes or 0)
     peak_after = int(plan.estimated_peak_after_bytes or 0)
     estimated_peak_delta = max(0, peak_before - peak_after)
@@ -483,6 +518,7 @@ def validate_checkpoint_plan(
         retained_nodes=len(retained),
         recompute_nodes=len(recompute),
         min_candidate_mem_bytes=min_candidate_mem,
+        optimize_region=optimize_region,
         estimated_peak_delta_bytes=estimated_peak_delta,
         largest_candidates=largest_candidates,
         errors=errors,
@@ -509,7 +545,6 @@ def build_checkpoint_plan(
     first_bw_use: Dict[Any, Any] = {}
     required_inputs_map: Dict[Any, Set[Any]] = {}
 
-    estimated_peak_before, _ = graph_profiler.compute_peak_memory()
     candidates = _collect_policy_candidates(graph_profiler, activations)
     selected_mem_bytes, selected_recompute_ms, estimated_peak_after = _select_recompute_nodes(
         graph_profiler=graph_profiler,
@@ -520,8 +555,9 @@ def build_checkpoint_plan(
         required_inputs_map=required_inputs_map,
         config=config,
     )
+    estimated_peak_before = estimated_peak_after + selected_mem_bytes
 
-    # Report the implied memory target after algorithmic selection.
+    # Report the implied memory target for the selected optimization region.
     memory_limit_bytes = max(0, estimated_peak_after)
     return CheckpointPlan(
         retained_nodes=retained,
@@ -533,4 +569,5 @@ def build_checkpoint_plan(
         estimated_peak_before_bytes=estimated_peak_before,
         estimated_peak_after_bytes=estimated_peak_after,
         memory_limit_bytes=memory_limit_bytes,
+        optimize_region=config.optimize_region,
     )
