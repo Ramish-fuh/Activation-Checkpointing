@@ -589,14 +589,26 @@ class GraphProfiler(fx.Interpreter):
             if n.users and all(u.target is operator.getitem for u in n.users)
         }
 
-    def _collect_recompute_closure(self, target: fx.Node) -> Set[fx.Node]:
+    def _collect_recompute_closure(
+        self,
+        target: fx.Node,
+        recompute_nodes: Optional[Set[fx.Node]] = None,
+    ) -> Set[fx.Node]:
         """Collect the forward-region nodes needed to recompute *target*.
 
         This mirrors the dependency walk used by the checkpoint policy and is
         used to mark temporary recompute dependencies as short-lived.
         """
+        recompute_nodes = set(recompute_nodes or {target})
         closure: Set[fx.Node] = set()
         visited: Set[fx.Node] = set()
+
+        def is_retained_activation_boundary(node: fx.Node) -> bool:
+            return (
+                node not in recompute_nodes
+                and self.node_type.get(node) is NodeType.ACT
+                and self.first_bw_access.get(node) is not None
+            )
 
         def visit(node: fx.Node) -> None:
             if node in visited:
@@ -608,6 +620,10 @@ class GraphProfiler(fx.Interpreter):
 
             nt = self.node_type.get(node, NodeType.OTHER)
             if node.op == OP.PLACEHOLDER or nt is NodeType.PARAM:
+                closure.add(node)
+                return
+
+            if is_retained_activation_boundary(node):
                 closure.add(node)
                 return
 
@@ -771,7 +787,7 @@ class GraphProfiler(fx.Interpreter):
             lbw_idx = self.node_index[lbw]
             act_live_ranges[act] = (fbw_idx, lbw_idx)
 
-            for dep in self._collect_recompute_closure(act):
+            for dep in self._collect_recompute_closure(act, recompute_acts):
                 if dep is act or dep in retained_nodes:
                     continue
                 dep_type = self.node_type.get(dep, NodeType.OTHER)

@@ -302,12 +302,19 @@ def _select_recompute_nodes(
         best_row: Optional[CandidateRow] = None
         best_trial_peak = current_peak
         best_trial_first_bw: Dict[Any, Any] = {}
+        best_trial_required_inputs: Set[Any] = set()
+        best_trial_recompute_ms = 0.0
         best_delta_peak = 0
         best_utility = float("-inf")
 
         for row in remaining:
             trial_recompute = set(recompute)
             trial_recompute.add(row.node)
+            trial_required_inputs, trial_recompute_ms = _estimate_recompute_metrics(
+                row.node,
+                graph_profiler,
+                trial_recompute,
+            )
 
             trial_first_bw = dict(first_bw_use)
             if row.fbw_node is not None:
@@ -337,7 +344,7 @@ def _select_recompute_nodes(
             if delta_peak <= 0:
                 continue
 
-            utility = float(delta_peak) / max(row.recompute_time_ms, 1e-6)
+            utility = float(delta_peak) / max(trial_recompute_ms, 1e-6)
             if (
                 utility > best_utility
                 or (
@@ -354,6 +361,8 @@ def _select_recompute_nodes(
                 best_row = row
                 best_trial_peak = trial_peak
                 best_trial_first_bw = trial_first_bw
+                best_trial_required_inputs = trial_required_inputs
+                best_trial_recompute_ms = trial_recompute_ms
                 best_delta_peak = delta_peak
                 best_utility = utility
 
@@ -368,12 +377,12 @@ def _select_recompute_nodes(
 
         recompute.add(best_row.node)
         retained.discard(best_row.node)
-        selected_recompute_ms += best_row.recompute_time_ms
+        selected_recompute_ms += best_trial_recompute_ms
 
         if best_row.fbw_node is not None:
             first_bw_use.clear()
             first_bw_use.update(best_trial_first_bw)
-        required_inputs_map[best_row.node] = set(best_row.req_inputs)
+        required_inputs_map[best_row.node] = set(best_trial_required_inputs)
 
         current_peak = best_trial_peak
         selected_peak_drop = int(estimated_peak_before) - int(current_peak)
@@ -381,18 +390,39 @@ def _select_recompute_nodes(
         remaining = [row for row in remaining if row.node is not best_row.node]
         selected_steps += 1
 
+    if recompute:
+        selected_recompute_ms = 0.0
+        required_inputs_map.clear()
+        for node in sorted(recompute, key=lambda n: graph_profiler.node_index.get(n, 10**9)):
+            req_inputs, recompute_time_ms = _estimate_recompute_metrics(
+                node,
+                graph_profiler,
+                recompute,
+            )
+            required_inputs_map[node] = req_inputs
+            selected_recompute_ms += recompute_time_ms
+
     return max(0, selected_peak_drop), selected_recompute_ms, int(current_peak)
 
 
 def _estimate_recompute_metrics(
     target_node: Any,
     graph_profiler: Any,
+    recompute_set: Optional[Set[Any]] = None,
 ) -> Tuple[Set[Any], float]:
     """Estimate the recompute boundary inputs and total runtime cost for one activation."""
 
+    recompute_set = set(recompute_set or {target_node})
     required_inputs: Set[Any] = set()
     recompute_nodes: Set[Any] = set()
     visited: Set[Any] = set()
+
+    def is_retained_activation_boundary(node: Any) -> bool:
+        return (
+            node not in recompute_set
+            and graph_profiler.node_type.get(node) == NodeType.ACT
+            and graph_profiler.first_bw_access.get(node) is not None
+        )
 
     def visit(node: Any) -> None:
         if node in visited:
@@ -409,6 +439,10 @@ def _estimate_recompute_metrics(
 
         node_type = graph_profiler.node_type.get(node)
         if node_type == NodeType.PARAM:
+            required_inputs.add(node)
+            return
+
+        if is_retained_activation_boundary(node):
             required_inputs.add(node)
             return
 
