@@ -982,7 +982,12 @@ class GraphProfiler(fx.Interpreter):
                 cp_save_path = None
             
             self._generate_single_plot(
-                breakdown_cp, peak_cp, plot_region, title, cp_save_path, "With Checkpoint"
+                breakdown_cp,
+                peak_cp,
+                plot_region,
+                title,
+                cp_save_path,
+                "Checkpoint Plan (Modeled)",
             )
 
     def plot_memory_vs_opid(
@@ -1029,7 +1034,7 @@ class GraphProfiler(fx.Interpreter):
                 linewidth=2.0,
                 linestyle="--",
                 color="#d62728",
-                label="With Checkpoint",
+                label="Checkpoint Plan (modeled)",
             )
 
         ax.axvline(self.sep_idx + 1, color="black", linestyle=":", linewidth=1.3, label="sep")
@@ -1103,7 +1108,13 @@ class GraphProfiler(fx.Interpreter):
             _, _, totals_cp = self._build_memory_timeline(alive_cp)
             cp = _phase_peaks(totals_cp)
             cp_vals = [cp[p] for p in phases]
-            ax.bar([i + width / 2 for i in x], cp_vals, width, label="With Checkpoint", color="#d62728")
+            ax.bar(
+                [i + width / 2 for i in x],
+                cp_vals,
+                width,
+                label="Checkpoint Plan (modeled)",
+                color="#d62728",
+            )
 
         ax.set_xticks(x)
         ax.set_xticklabels(phases)
@@ -1178,7 +1189,7 @@ class GraphProfiler(fx.Interpreter):
 
         ax.set_xlabel("operations")
         ax.set_ylabel("Memory (MB)")
-        suffix = " (with checkpoint)" if checkpoint_plan is not None else ""
+        suffix = " (checkpoint plan modeled)" if checkpoint_plan is not None else ""
         ax.set_title(f"Memory Components vs Operations{suffix}{' -- ' + title if title else ''}")
         ax.grid(alpha=0.3)
         ax.legend()

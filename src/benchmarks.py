@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import copy
+import time
 from typing import Any, Dict, List
 
 import torch
@@ -21,7 +22,7 @@ import torch.fx as fx
 from torchvision.models import resnet152
 from graph_prof import GraphProfiler
 from mu_two_policy import build_checkpoint_plan, PolicyConfig, validate_checkpoint_plan
-from activation_checkpoint import apply_checkpoint_plan, smoke_check_graph
+from activation_checkpoint import apply_checkpoint_plan, clone_graph_inputs, smoke_check_graph
 from graph_tracer import SEPFunction, compile
 
 try:
@@ -110,6 +111,37 @@ class Experiment:
             self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, fused=True, capturable=True)
             self.train_step = resnet_train_step
 
+    def _measure_graph_latency_ms(
+        self,
+        gm: fx.GraphModule,
+        args: Any,
+        warmup_iters: int = 1,
+        measured_iters: int = 3,
+    ) -> float:
+        """Measure raw FX graph replay latency on cloned inputs."""
+        measured_iters = max(1, measured_iters)
+        bench_args = clone_graph_inputs(args)
+
+        with torch.no_grad():
+            for _ in range(max(0, warmup_iters)):
+                gm(*bench_args)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(measured_iters):
+                    gm(*bench_args)
+                end.record()
+                torch.cuda.synchronize()
+                return float(start.elapsed_time(end) / measured_iters)
+
+            start_time = time.perf_counter()
+            for _ in range(measured_iters):
+                gm(*bench_args)
+            return float((time.perf_counter() - start_time) * 1000.0 / measured_iters)
+
     def loss_fn(self, logits: torch.Tensor, targets: torch.Tensor):
         """Cross-entropy loss, flattened over all sequence positions."""
         return F.cross_entropy(
@@ -177,6 +209,10 @@ class Experiment:
             plan_path = os.path.join(
                 plots_dir,
                 f"checkpoint_plan_{self.model_name}_bs{self.batch_size}.json",
+            )
+            report_path = os.path.join(
+                plots_dir,
+                f"experiment_summary_{self.model_name}_bs{self.batch_size}.json",
             )
             with open(plan_path, "w", encoding="utf-8") as f:
                 plan_payload = plan.to_dict()
@@ -270,6 +306,21 @@ class Experiment:
             except Exception as e:
                 print(f"Warning: could not save component-memory checkpoint plot: {e}")
 
+            latency_report: Dict[str, Any] = {
+                "kind": "raw_fx_graph_replay_ms_on_cloned_inputs",
+                "warmup_iters": 1,
+                "measured_iters": 3,
+                "baseline_ms": None,
+                "checkpoint_ms": None,
+                "overhead_ms": None,
+                "overhead_percent": None,
+            }
+            try:
+                latency_report["baseline_ms"] = self._measure_graph_latency_ms(gm, args)
+            except Exception as e:
+                latency_report["baseline_error"] = repr(e)
+                print(f"Warning: could not measure baseline graph latency: {e}")
+
             if not validation.ok:
                 rewrite_status["reason"] = "validation failed"
             elif not plan.recompute_nodes:
@@ -284,6 +335,21 @@ class Experiment:
                         gm = candidate_gm
                         rewrite_status["applied"] = True
                         rewrite_status["reason"] = "rewrite smoke check passed"
+                        try:
+                            latency_report["checkpoint_ms"] = self._measure_graph_latency_ms(
+                                candidate_gm,
+                                args,
+                            )
+                            baseline_ms = latency_report["baseline_ms"]
+                            checkpoint_ms = latency_report["checkpoint_ms"]
+                            if baseline_ms:
+                                latency_report["overhead_ms"] = checkpoint_ms - baseline_ms
+                                latency_report["overhead_percent"] = (
+                                    (checkpoint_ms / baseline_ms - 1.0) * 100.0
+                                )
+                        except Exception as e:
+                            latency_report["checkpoint_error"] = repr(e)
+                            print(f"Warning: could not measure checkpoint graph latency: {e}")
                         print("Checkpoint rewrite applied to FX graph.")
                     else:
                         rewrite_status["error"] = error
@@ -305,6 +371,40 @@ class Experiment:
                 plan_payload["validation"] = validation.to_dict()
                 plan_payload["rewrite_status"] = rewrite_status
                 json.dump(plan_payload, f, indent=2)
+
+            experiment_summary = {
+                "model_name": self.model_name,
+                "batch_size": self.batch_size,
+                "policy": {
+                    "name": "single_model_budgeted_greedy_mu_two_style",
+                    "optimize_region": plan.optimize_region,
+                    "memory_limit_bytes": plan.memory_limit_bytes,
+                    "memory_budget_satisfied": validation.memory_budget_satisfied,
+                    "recompute_nodes": sorted(n.name for n in plan.recompute_nodes),
+                    "estimated_recompute_overhead_ms": plan.estimated_recompute_overhead_ms,
+                },
+                "memory": {
+                    "kind": "liveness_estimate_from_profiled_node_bytes",
+                    "forward_peak_baseline_bytes": validation.forward_peak_before_bytes,
+                    "forward_peak_checkpoint_bytes": validation.forward_peak_after_bytes,
+                    "overall_peak_baseline_bytes": validation.overall_peak_before_bytes,
+                    "overall_peak_checkpoint_bytes": validation.overall_peak_after_bytes,
+                    "estimated_memory_saved_bytes": plan.estimated_memory_saved_bytes,
+                },
+                "latency": latency_report,
+                "rewrite_status": rewrite_status,
+                "plot_files": {
+                    "forward_peak": os.path.abspath(save_path_fw),
+                    "overall_peak": os.path.abspath(save_path_overall),
+                    "memory_vs_opid": os.path.abspath(save_path_timeline),
+                    "phase_memory": os.path.abspath(save_path_phase),
+                    "components_baseline": os.path.abspath(save_path_components),
+                    "components_checkpoint": os.path.abspath(save_path_components_cp),
+                },
+            }
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(experiment_summary, f, indent=2)
+            print(f"Saved experiment summary: {os.path.abspath(report_path)}")
 
         return gm
 
