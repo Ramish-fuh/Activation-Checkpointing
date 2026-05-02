@@ -111,36 +111,71 @@ class Experiment:
             self.optimizer = optim.Adam(self.model.parameters(), lr=1e-2, fused=True, capturable=True)
             self.train_step = resnet_train_step
 
-    def _measure_graph_latency_ms(
+    def _time_graph_once_ms(
         self,
         gm: fx.GraphModule,
         args: Any,
-        warmup_iters: int = 1,
-        measured_iters: int = 3,
     ) -> float:
-        """Measure raw FX graph replay latency on cloned inputs."""
-        measured_iters = max(1, measured_iters)
+        """Time one FX graph replay on freshly cloned inputs."""
         bench_args = clone_graph_inputs(args)
 
         with torch.no_grad():
-            for _ in range(max(0, warmup_iters)):
-                gm(*bench_args)
-
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-                for _ in range(measured_iters):
-                    gm(*bench_args)
+                gm(*bench_args)
                 end.record()
                 torch.cuda.synchronize()
-                return float(start.elapsed_time(end) / measured_iters)
+                return float(start.elapsed_time(end))
 
             start_time = time.perf_counter()
-            for _ in range(measured_iters):
-                gm(*bench_args)
-            return float((time.perf_counter() - start_time) * 1000.0 / measured_iters)
+            gm(*bench_args)
+            return float((time.perf_counter() - start_time) * 1000.0)
+
+    def _measure_latency_comparison(
+        self,
+        baseline_gm: fx.GraphModule,
+        checkpoint_gm: fx.GraphModule,
+        args: Any,
+        warmup_iters: int = 2,
+        measured_iters: int = 5,
+    ) -> Dict[str, Any]:
+        """Measure baseline/checkpoint graph replay latency in paired trials."""
+        measured_iters = max(1, measured_iters)
+        warmup_iters = max(0, warmup_iters)
+
+        with torch.no_grad():
+            for _ in range(warmup_iters):
+                baseline_gm(*clone_graph_inputs(args))
+                checkpoint_gm(*clone_graph_inputs(args))
+
+        baseline_samples: List[float] = []
+        checkpoint_samples: List[float] = []
+        for idx in range(measured_iters):
+            if idx % 2 == 0:
+                baseline_samples.append(self._time_graph_once_ms(baseline_gm, args))
+                checkpoint_samples.append(self._time_graph_once_ms(checkpoint_gm, args))
+            else:
+                checkpoint_samples.append(self._time_graph_once_ms(checkpoint_gm, args))
+                baseline_samples.append(self._time_graph_once_ms(baseline_gm, args))
+
+        baseline_ms = sum(baseline_samples) / len(baseline_samples)
+        checkpoint_ms = sum(checkpoint_samples) / len(checkpoint_samples)
+        overhead_ms = checkpoint_ms - baseline_ms
+        overhead_percent = (checkpoint_ms / baseline_ms - 1.0) * 100.0 if baseline_ms else None
+        return {
+            "kind": "paired_raw_fx_graph_replay_ms_on_fresh_cloned_inputs",
+            "warmup_iters": warmup_iters,
+            "measured_iters": measured_iters,
+            "baseline_ms": baseline_ms,
+            "checkpoint_ms": checkpoint_ms,
+            "overhead_ms": overhead_ms,
+            "overhead_percent": overhead_percent,
+            "baseline_samples_ms": baseline_samples,
+            "checkpoint_samples_ms": checkpoint_samples,
+        }
 
     def loss_fn(self, logits: torch.Tensor, targets: torch.Tensor):
         """Cross-entropy loss, flattened over all sequence positions."""
@@ -307,19 +342,14 @@ class Experiment:
                 print(f"Warning: could not save component-memory checkpoint plot: {e}")
 
             latency_report: Dict[str, Any] = {
-                "kind": "raw_fx_graph_replay_ms_on_cloned_inputs",
-                "warmup_iters": 1,
-                "measured_iters": 3,
+                "kind": "paired_raw_fx_graph_replay_ms_on_fresh_cloned_inputs",
+                "warmup_iters": 2,
+                "measured_iters": 5,
                 "baseline_ms": None,
                 "checkpoint_ms": None,
                 "overhead_ms": None,
                 "overhead_percent": None,
             }
-            try:
-                latency_report["baseline_ms"] = self._measure_graph_latency_ms(gm, args)
-            except Exception as e:
-                latency_report["baseline_error"] = repr(e)
-                print(f"Warning: could not measure baseline graph latency: {e}")
 
             if not validation.ok:
                 rewrite_status["reason"] = "validation failed"
@@ -332,24 +362,19 @@ class Experiment:
                     candidate_gm = apply_checkpoint_plan(candidate_gm, plan)
                     ok, error = smoke_check_graph(candidate_gm, args, reference_gm=gm)
                     if ok:
+                        baseline_gm = gm
                         gm = candidate_gm
                         rewrite_status["applied"] = True
                         rewrite_status["reason"] = "rewrite smoke check passed"
                         try:
-                            latency_report["checkpoint_ms"] = self._measure_graph_latency_ms(
+                            latency_report = self._measure_latency_comparison(
+                                baseline_gm,
                                 candidate_gm,
                                 args,
                             )
-                            baseline_ms = latency_report["baseline_ms"]
-                            checkpoint_ms = latency_report["checkpoint_ms"]
-                            if baseline_ms:
-                                latency_report["overhead_ms"] = checkpoint_ms - baseline_ms
-                                latency_report["overhead_percent"] = (
-                                    (checkpoint_ms / baseline_ms - 1.0) * 100.0
-                                )
                         except Exception as e:
-                            latency_report["checkpoint_error"] = repr(e)
-                            print(f"Warning: could not measure checkpoint graph latency: {e}")
+                            latency_report["comparison_error"] = repr(e)
+                            print(f"Warning: could not measure graph latency comparison: {e}")
                         print("Checkpoint rewrite applied to FX graph.")
                     else:
                         rewrite_status["error"] = error
