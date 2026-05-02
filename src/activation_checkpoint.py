@@ -1,4 +1,5 @@
 import copy
+import inspect
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,28 @@ def get_name_to_node_map(gm: fx.GraphModule) -> Dict[str, fx.Node]:
     return name_to_node
 
 
+def extract_recompute_subgraph(
+    joint_graph: fx.Graph,
+    inputs: List[fx.Node],
+    outputs: List[fx.Node],
+) -> fx.Graph:
+    """Call PyTorch's private extractor across supported signatures."""
+    kwargs = {
+        "joint_graph": joint_graph,
+        "inputs": inputs,
+        "outputs": outputs,
+    }
+    params = inspect.signature(_extract_graph_with_inputs_outputs).parameters
+    if "outputs_descs" in params:
+        kwargs["outputs_descs"] = [None] * len(outputs)
+    if "subgraph" in params:
+        kwargs["subgraph"] = "forward"
+
+    if len(kwargs) > 3:
+        return _extract_graph_with_inputs_outputs(**kwargs)
+    return _extract_graph_with_inputs_outputs(joint_graph, inputs, outputs)
+
+
 def apply_checkpoint_plan(gm: fx.GraphModule, plan: CheckpointPlan) -> fx.GraphModule:
     """Apply a policy-generated checkpoint plan to the joint fwd+bwd graph.
 
@@ -108,10 +131,10 @@ def apply_checkpoint_plan(gm: fx.GraphModule, plan: CheckpointPlan) -> fx.GraphM
         if not required_inputs:
             raise ValueError(f"Recompute target {target_name} has empty boundary inputs")
 
-        recompute_subgraph = _extract_graph_with_inputs_outputs(
-            joint_graph=gm.graph,
-            inputs=required_inputs,
-            outputs=[target_node],
+        recompute_subgraph = extract_recompute_subgraph(
+            gm.graph,
+            required_inputs,
+            [target_node],
         )
 
         copy_env = dict(name_to_node)
@@ -236,10 +259,10 @@ def activation_checkpointing(gm: fx.GraphModule) -> fx.GraphModule:
     # intermediate node that is retained (checkpointed).
 
     # Obtain a sub-graph that recomputes the required nodes
-    recompute_subgraph = _extract_graph_with_inputs_outputs(
-        joint_graph=gm.graph,
-        inputs=nodes_required_to_recompute,
-        outputs=node_to_recompute,
+    recompute_subgraph = extract_recompute_subgraph(
+        gm.graph,
+        nodes_required_to_recompute,
+        node_to_recompute,
     )
     print("Extracted recomputation sub-graph: ")
     recompute_subgraph.print_tabular()
