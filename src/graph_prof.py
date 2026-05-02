@@ -776,6 +776,7 @@ class GraphProfiler(fx.Interpreter):
         first_bw_use = getattr(checkpoint_plan, "first_backward_use", {})
 
         temp_dep_step: Dict[fx.Node, int] = {}
+        boundary_input_last_step: Dict[fx.Node, int] = {}
         act_live_ranges: Dict[fx.Node, Tuple[int, int]] = {}
 
         for act in recompute_acts:
@@ -790,11 +791,27 @@ class GraphProfiler(fx.Interpreter):
             for dep in self._collect_recompute_closure(act):
                 if dep is act or dep in retained_nodes:
                     continue
+                dep_type = self.node_type.get(dep, NodeType.OTHER)
+                if dep.op == OP.PLACEHOLDER or dep_type in (NodeType.PARAM, NodeType.GRAD, NodeType.OPT):
+                    if dep.op == OP.PLACEHOLDER:
+                        boundary_input_last_step[dep] = max(
+                            boundary_input_last_step.get(dep, -1),
+                            fbw_idx,
+                        )
+                    continue
                 if dep not in temp_dep_step or fbw_idx < temp_dep_step[dep]:
                     temp_dep_step[dep] = fbw_idx
 
         for node, (born, dies) in base_alive.items():
             nt = self.node_type.get(node, NodeType.OTHER)
+            if nt in (NodeType.PARAM, NodeType.GRAD, NodeType.OPT):
+                adjusted[node] = (born, dies)
+                continue
+
+            if node in boundary_input_last_step:
+                adjusted[node] = (born, max(dies, boundary_input_last_step[node]))
+                continue
+
             if node in act_live_ranges:
                 adjusted[node] = act_live_ranges[node]
                 continue
@@ -1160,19 +1177,20 @@ class GraphProfiler(fx.Interpreter):
 
         categories = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPT, NodeType.OTHER]
         labels     = [nt.name for nt in categories]
-        sizes_mb   = [breakdown.get(nt, 0) / 1024**2 for nt in categories]
+        sizes_bytes = [breakdown.get(nt, 0) for nt in categories]
+        sizes_mb   = [size / 1024**2 for size in sizes_bytes]
         colors     = ["#4C72B0", "#DD8452", "#55A868", "#8172B3", "#C44E52"]
 
         fig, (ax_bar, ax_pie) = plt.subplots(1, 2, figsize=(12, 5))
 
         # Bar chart -- absolute MB per type
         bars = ax_bar.bar(labels, sizes_mb, color=colors, edgecolor="black")
-        for bar, val in zip(bars, sizes_mb):
-            if val > 0:
+        for bar, val_mb, val_bytes in zip(bars, sizes_mb, sizes_bytes):
+            if val_bytes > 0:
                 ax_bar.text(
                     bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 0.3,
-                    f"{val:.1f}",
+                    self._fmt_bytes(val_bytes),
                     ha="center", va="bottom", fontsize=10,
                 )
         ax_bar.set_ylabel("Memory (MB)")
@@ -1180,9 +1198,17 @@ class GraphProfiler(fx.Interpreter):
         ax_bar.grid(axis="y", alpha=0.3)
 
         # Pie chart -- percentage breakdown
-        nonzero = [(l, s, c) for l, s, c in zip(labels, sizes_mb, colors) if s > 0]
+        nonzero = [
+            (label, size_mb, size_bytes, color)
+            for label, size_mb, size_bytes, color in zip(labels, sizes_mb, sizes_bytes, colors)
+            if size_bytes > 0
+        ]
         if nonzero:
-            pie_labels, pie_sizes, pie_colors = zip(*nonzero)
+            pie_labels, pie_sizes, _, pie_colors = zip(*nonzero)
+            pie_labels = tuple(
+                f"{label}\n{self._fmt_bytes(size_bytes)}"
+                for label, _, size_bytes, _ in nonzero
+            )
             ax_pie.pie(
                 pie_sizes, labels=pie_labels, colors=pie_colors,
                 autopct="%1.1f%%", startangle=90, textprops={"fontsize": 10},
