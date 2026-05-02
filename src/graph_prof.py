@@ -753,27 +753,6 @@ class GraphProfiler(fx.Interpreter):
 
         return peak_step, peak_bytes, peak_bd
 
-    def _filter_alive_for_checkpoint(
-        self,
-        alive: Dict[fx.Node, Tuple[int, int]],
-        checkpoint_plan: Any,
-    ) -> Dict[fx.Node, Tuple[int, int]]:
-        """Filter alive ranges to exclude recomputed activations.
-        
-        Keeps only nodes that are in checkpoint_plan.retained_nodes,
-        or are not activations (e.g., PARAM, GRAD, OPT).
-        """
-        filtered: Dict[fx.Node, Tuple[int, int]] = {}
-        for node, (born, dies) in alive.items():
-            # Keep node if it's not an activation, or if it's in retained set
-            node_type = self.node_type.get(node, NodeType.OTHER)
-            if node_type != NodeType.ACT:
-                filtered[node] = (born, dies)
-            elif node in checkpoint_plan.retained_nodes:
-                filtered[node] = (born, dies)
-            # else: skip recomputed activations (they don't live in forward with checkpoint)
-        return filtered
-
     def _build_alive_ranges_with_checkpoint(
         self,
         decomposed: Set[fx.Node],
@@ -912,9 +891,13 @@ class GraphProfiler(fx.Interpreter):
             breakdown, peak, plot_region, title, save_path, "Baseline (Without Checkpoint)"
         )
 
-        # If checkpoint plan provided, generate with-checkpoint plot
+        # If checkpoint plan provided, generate with-checkpoint plot using the
+        # same recomputation-aware lifetime model as timeline/phase plots.
         if checkpoint_plan is not None:
-            alive_with_cp = self._filter_alive_for_checkpoint(alive, checkpoint_plan)
+            alive_with_cp = self._build_alive_ranges_with_checkpoint(
+                decomposed,
+                checkpoint_plan,
+            )
             if forward_only:
                 fw_peak_step_cp, peak_cp, breakdown_cp = self._sweep_for_forward_peak(alive_with_cp)
             else:
