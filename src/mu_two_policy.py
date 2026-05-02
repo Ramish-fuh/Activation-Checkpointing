@@ -73,6 +73,7 @@ class PlanValidationReport:
     recompute_nodes: int
     min_candidate_mem_bytes: int
     excluded_param_only_candidates: int
+    excluded_alias_candidates: int
     optimize_region: str
     estimated_peak_delta_bytes: int
     forward_peak_before_bytes: int
@@ -96,6 +97,7 @@ class PlanValidationReport:
             "recompute_nodes": self.recompute_nodes,
             "min_candidate_mem_bytes": self.min_candidate_mem_bytes,
             "excluded_param_only_candidates": self.excluded_param_only_candidates,
+            "excluded_alias_candidates": self.excluded_alias_candidates,
             "optimize_region": self.optimize_region,
             "estimated_peak_delta_bytes": self.estimated_peak_delta_bytes,
             "forward_peak_before_bytes": self.forward_peak_before_bytes,
@@ -115,6 +117,7 @@ class PlanValidationReport:
             f"  eligible_candidates={self.eligible_candidates} "
             f"(min={_fmt_bytes(self.min_candidate_mem_bytes)})",
             f"  excluded_param_only_candidates={self.excluded_param_only_candidates}",
+            f"  excluded_alias_candidates={self.excluded_alias_candidates}",
             f"  optimize_region={self.optimize_region}",
             f"  retained_nodes={self.retained_nodes}",
             f"  recompute_nodes={self.recompute_nodes}",
@@ -170,6 +173,33 @@ def _is_param_only_candidate(graph_profiler: Any, row: CandidateRow) -> bool:
     if not row.req_inputs:
         return False
     return all(graph_profiler.node_type.get(inp) == NodeType.PARAM for inp in row.req_inputs)
+
+
+def _is_alias_candidate(graph_profiler: Any, row: CandidateRow) -> bool:
+    """True when the target is a view-like metadata node.
+
+    Activation checkpointing should target tensors that own activation storage.
+    View/transpose/expand/slice nodes can be saved by autograd, but they mostly
+    describe another tensor's storage and make poor checkpoint targets.
+    """
+    is_alias_node = getattr(graph_profiler, "_is_alias_node", None)
+    if callable(is_alias_node) and is_alias_node(row.node):
+        return True
+
+    name = getattr(row.node, "name", "")
+    alias_name_prefixes = (
+        "view",
+        "transpose",
+        "expand",
+        "slice",
+        "select",
+        "squeeze",
+        "unsqueeze",
+        "permute",
+    )
+    if name == "t" or name.startswith("t_"):
+        return True
+    return any(name == prefix or name.startswith(f"{prefix}_") for prefix in alias_name_prefixes)
 
 
 def _compute_peak_from_alive(
@@ -273,6 +303,7 @@ def _select_recompute_nodes(
         for row in candidates
         if row.mem >= max(0, config.min_candidate_mem_bytes)
         and not _is_param_only_candidate(graph_profiler, row)
+        and not _is_alias_candidate(graph_profiler, row)
     ]
     if not usable:
         return 0, 0.0, estimated_peak_before
@@ -512,24 +543,37 @@ def validate_checkpoint_plan(
         for row in candidate_rows
         if row.mem >= min_candidate_mem and _is_param_only_candidate(graph_profiler, row)
     )
+    excluded_alias = sum(
+        1
+        for row in candidate_rows
+        if row.mem >= min_candidate_mem and _is_alias_candidate(graph_profiler, row)
+    )
     eligible = [
         row.node
         for row in candidate_rows
-        if row.mem >= min_candidate_mem and not _is_param_only_candidate(graph_profiler, row)
+        if row.mem >= min_candidate_mem
+        and not _is_param_only_candidate(graph_profiler, row)
+        and not _is_alias_candidate(graph_profiler, row)
+    ]
+    largest_candidate_rows = [
+        row
+        for row in candidate_rows
+        if not _is_param_only_candidate(graph_profiler, row)
+        and not _is_alias_candidate(graph_profiler, row)
     ]
     largest_candidates = [
         {
-            "name": n.name,
-            "memory_bytes": int(graph_profiler.node_mem_bytes.get(n.name, 0)),
+            "name": row.node.name,
+            "memory_bytes": int(graph_profiler.node_mem_bytes.get(row.node.name, 0)),
             "first_backward_use": (
-                graph_profiler.first_bw_access[n].name
-                if graph_profiler.first_bw_access.get(n) is not None
+                graph_profiler.first_bw_access[row.node].name
+                if graph_profiler.first_bw_access.get(row.node) is not None
                 else None
             ),
         }
-        for n in sorted(
-            activations,
-            key=lambda node: int(graph_profiler.node_mem_bytes.get(node.name, 0)),
+        for row in sorted(
+            largest_candidate_rows,
+            key=lambda candidate: int(graph_profiler.node_mem_bytes.get(candidate.node.name, 0)),
             reverse=True,
         )[:10]
     ]
@@ -554,6 +598,12 @@ def validate_checkpoint_plan(
 
         if graph_profiler.node_type.get(node) != NodeType.ACT:
             errors.append(f"Recompute target {node.name} is not classified as ACT")
+
+        if _is_alias_candidate(
+            graph_profiler,
+            CandidateRow(node=node, mem=0, recompute_time_ms=0.0, fbw_node=None, req_inputs=set()),
+        ):
+            errors.append(f"Recompute target {node.name} is an alias/view metadata node")
 
         mem = int(graph_profiler.node_mem_bytes.get(node.name, 0))
         if mem <= 0:
@@ -653,6 +703,7 @@ def validate_checkpoint_plan(
         recompute_nodes=len(recompute),
         min_candidate_mem_bytes=min_candidate_mem,
         excluded_param_only_candidates=excluded_param_only,
+        excluded_alias_candidates=excluded_alias,
         optimize_region=optimize_region,
         estimated_peak_delta_bytes=estimated_peak_delta,
         forward_peak_before_bytes=forward_peak_before,
