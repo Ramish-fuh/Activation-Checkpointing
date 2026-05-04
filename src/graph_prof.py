@@ -1015,27 +1015,19 @@ class GraphProfiler(fx.Interpreter):
             importlib.reload(plt)
 
         decomposed = self._find_decomposed_parents()
+        # Build the alive ranges but do not plot the total-alive series
+        # (user requested removing TOTAL / "total alive" from all plots).
         alive_baseline = self._build_alive_ranges(decomposed)
-        steps, _, totals = self._build_memory_timeline(alive_baseline)
+        steps, _, _ = self._build_memory_timeline(alive_baseline)
 
         op_counts = [s + 1 for s in steps]
-        totals_mb = [v / 1024**2 for v in totals]
         fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-        ax.step(op_counts, totals_mb, where="post", linewidth=2.0, color="#1f77b4", label="Baseline")
 
+        # If a checkpoint plan is provided we still prepare an adjusted alive
+        # set for other annotations, but deliberately avoid plotting any
+        # aggregate "total" series.
         if checkpoint_plan is not None:
             alive_cp = self._build_alive_ranges_with_checkpoint(decomposed, checkpoint_plan)
-            _, _, totals_cp = self._build_memory_timeline(alive_cp)
-            totals_cp_mb = [v / 1024**2 for v in totals_cp]
-            ax.step(
-                op_counts,
-                totals_cp_mb,
-                where="post",
-                linewidth=2.0,
-                linestyle="--",
-                color="#d62728",
-                label="Checkpoint Plan (modeled)",
-            )
 
         ax.axvline(self.sep_idx + 1, color="black", linestyle=":", linewidth=1.3, label="sep")
         ax.axvline(self.sep_bw_idx + 1, color="gray", linestyle=":", linewidth=1.3, label="sep_backward")
@@ -1174,8 +1166,6 @@ class GraphProfiler(fx.Interpreter):
         grads_mb = [s.get(NodeType.GRAD, 0) / 1024**2 for s in by_type_series]
         feats_mb = [s.get(NodeType.ACT, 0) / 1024**2 for s in by_type_series]
         other_mb = [s.get(NodeType.OTHER, 0) / 1024**2 for s in by_type_series]
-        total_mb = [sum(series.values()) / 1024**2 for series in by_type_series]
-
         # Match the diagnostic style where weights are shown as a near-horizontal
         # baseline across the full operation axis.
         w_level = max(weights_mb, default=0.0)
@@ -1186,7 +1176,6 @@ class GraphProfiler(fx.Interpreter):
         ax.step(op_counts, grads_mb, where="post", color="#ff7f0e", linewidth=1.8, label="gradients")
         ax.step(op_counts, feats_mb, where="post", color="#2ca02c", linewidth=1.8, label="feature maps")
         ax.step(op_counts, other_mb, where="post", color="#9467bd", linewidth=1.8, label="other")
-        ax.step(op_counts, total_mb, where="post", color="black", linewidth=2.2, linestyle="--", label="total alive")
         ax.axvline(self.sep_bw_idx + 1, color="black", linestyle="--", linewidth=1.1, label="fw_bw_boundary")
 
         ax.set_xlabel("operations")

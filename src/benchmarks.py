@@ -21,8 +21,9 @@ import torch.nn.functional as F
 import torch.fx as fx
 from torchvision.models import resnet152
 from graph_prof import GraphProfiler, NodeType
-from activation_checkpoint import clone_graph_inputs
+from activation_checkpoint import apply_checkpoint_plan, clone_graph_inputs, smoke_check_graph
 from graph_tracer import SEPFunction, compile
+from mu_two_policy import PolicyConfig, build_checkpoint_plan, validate_checkpoint_plan
 
 try:
     from transformers import BertConfig, BertForMaskedLM
@@ -119,6 +120,30 @@ def _build_phase1_diagnostics(profiler: GraphProfiler) -> Dict[str, Any]:
             "peak_total_bytes": max(totals, default=0),
             "peak_total_mb": _fmt_mb(max(totals, default=0)),
         },
+    }
+
+
+def _build_checkpoint_diagnostics(
+    profiler: GraphProfiler,
+    plan: Any,
+    report: Any,
+) -> Dict[str, Any]:
+    plan_dict = plan.to_dict()
+    report_dict = report.to_dict()
+    return {
+        "checkpoint_plan": plan_dict,
+        "checkpoint_validation": report_dict,
+        "checkpointable_activations": len(plan.retained_nodes) + len(plan.recompute_nodes),
+        "recompute_nodes": len(plan.recompute_nodes),
+        "retained_nodes": len(plan.retained_nodes),
+        "estimated_memory_saved_bytes": int(plan.estimated_memory_saved_bytes),
+        "estimated_recompute_overhead_ms": float(plan.estimated_recompute_overhead_ms),
+        "forward_peak_before_bytes": int(report.forward_peak_before_bytes),
+        "forward_peak_after_bytes": int(report.forward_peak_after_bytes),
+        "overall_peak_before_bytes": int(report.overall_peak_before_bytes),
+        "overall_peak_after_bytes": int(report.overall_peak_after_bytes),
+        "memory_budget_satisfied": report.memory_budget_satisfied,
+        "planner_ok": report.ok,
     }
 
 
@@ -235,7 +260,7 @@ def _save_type_growth_plot(profiler: GraphProfiler, save_path: str, title: str) 
         node_type.name: [series.get(node_type, 0) / 1024**2 for series in by_type_series]
         for node_type in NodeType
     }
-    total_mb = [value / 1024**2 for value in totals]
+    # note: do not plot the aggregate total series (TOTAL) — user requested removing it
 
     fig, ax = plt.subplots(1, 1, figsize=(13, 6))
     colors = {
@@ -257,16 +282,6 @@ def _save_type_growth_plot(profiler: GraphProfiler, save_path: str, title: str) 
             alpha=alpha,
             label=name,
         )
-
-    ax.step(
-        op_counts,
-        total_mb,
-        where="post",
-        linewidth=2.6,
-        color="black",
-        linestyle="--",
-        label="TOTAL",
-    )
     ax.axvline(profiler.sep_idx + 1, color="black", linestyle=":", linewidth=1.1, label="sep")
     ax.axvline(profiler.sep_bw_idx + 1, color="gray", linestyle=":", linewidth=1.1, label="sep_backward")
 
@@ -448,8 +463,9 @@ class Experiment:
         """Profile the traced graph and save the Phase 1 diagnostics bundle.
 
         The CUDA2 branch now keeps the active flow on profiling and reporting
-        only: no checkpoint plan selection, no graph rewrite, and no policy
-        budget knobs.
+        only baseline profiling by default, but also validates the Phase 3
+        checkpoint path by building a plan, rewriting the graph, and smoke
+        checking the transformed graph.
         """
         print(gm.graph.print_tabular())
 
@@ -537,6 +553,86 @@ class Experiment:
             print(f"Warning: could not save gradient-accumulation plot: {exc}")
 
         diagnostics = _build_phase1_diagnostics(graph_profiler)
+
+        checkpoint_plot_paths = {
+            "forward_peak_with_checkpoint": os.path.join(
+                plots_dir, f"peak_memory_breakdown_fw_{tag}_with_checkpoint.png"
+            ),
+            "overall_peak_with_checkpoint": os.path.join(
+                plots_dir, f"peak_memory_breakdown_overall_{tag}_with_checkpoint.png"
+            ),
+            "memory_vs_opid_with_checkpoint": os.path.join(
+                plots_dir, f"memory_vs_opid_{tag}_with_checkpoint.png"
+            ),
+        }
+
+        checkpoint_plan = None
+        checkpoint_report = None
+        checkpoint_graph = None
+        checkpoint_warning = None
+        checkpoint_config = PolicyConfig(default_memory_budget_fraction=0.5)
+        try:
+            checkpoint_plan = build_checkpoint_plan(graph_profiler, checkpoint_config)
+            checkpoint_report = validate_checkpoint_plan(graph_profiler, checkpoint_plan, checkpoint_config)
+            diagnostics["checkpoint"] = _build_checkpoint_diagnostics(
+                graph_profiler,
+                checkpoint_plan,
+                checkpoint_report,
+            )
+
+            if checkpoint_report.ok and checkpoint_plan.recompute_nodes:
+                checkpoint_graph = apply_checkpoint_plan(copy.deepcopy(gm), checkpoint_plan)
+                smoke_ok, smoke_message = smoke_check_graph(
+                    checkpoint_graph,
+                    args,
+                    reference_gm=gm,
+                )
+                diagnostics["checkpoint"]["smoke_check"] = {
+                    "ok": smoke_ok,
+                    "message": smoke_message,
+                }
+                if smoke_ok:
+                    try:
+                        graph_profiler.plot_peak_memory_breakdown(
+                            title=f"{self.model_name} (bs={self.batch_size})",
+                            save_path=checkpoint_plot_paths["forward_peak_with_checkpoint"],
+                            forward_only=True,
+                            checkpoint_plan=checkpoint_plan,
+                        )
+                    except Exception as exc:
+                        print(f"Warning: could not save checkpoint forward plot: {exc}")
+
+                    try:
+                        graph_profiler.plot_peak_memory_breakdown(
+                            title=f"{self.model_name} (bs={self.batch_size})",
+                            save_path=checkpoint_plot_paths["overall_peak_with_checkpoint"],
+                            forward_only=False,
+                            checkpoint_plan=checkpoint_plan,
+                        )
+                    except Exception as exc:
+                        print(f"Warning: could not save checkpoint overall plot: {exc}")
+
+                    try:
+                        graph_profiler.plot_memory_vs_opid(
+                            title=f"{self.model_name} (bs={self.batch_size})",
+                            save_path=checkpoint_plot_paths["memory_vs_opid_with_checkpoint"],
+                            checkpoint_plan=checkpoint_plan,
+                        )
+                    except Exception as exc:
+                        print(f"Warning: could not save checkpoint memory-vs-opid plot: {exc}")
+                else:
+                    checkpoint_warning = smoke_message
+                    print(f"Warning: checkpointed graph smoke check failed: {smoke_message}")
+            elif checkpoint_report is not None and not checkpoint_report.ok:
+                checkpoint_warning = checkpoint_report.format_summary()
+                print(checkpoint_warning)
+        except Exception as exc:
+            checkpoint_warning = repr(exc)
+            print(f"Warning: checkpoint planning/rewrite failed: {exc}")
+
+        if checkpoint_warning is not None:
+            diagnostics["checkpoint_warning"] = checkpoint_warning
+
         diagnostics["model_name"] = self.model_name
         diagnostics["batch_size"] = self.batch_size
         diagnostics["plot_files"] = {
@@ -549,6 +645,10 @@ class Experiment:
             "other_memory_components": os.path.abspath(save_path_other),
             "gradient_accumulation": os.path.abspath(save_path_grad),
         }
+        if checkpoint_plan is not None:
+            diagnostics["plot_files"].update(
+                {k: os.path.abspath(v) for k, v in checkpoint_plot_paths.items()}
+            )
 
         report_path = os.path.join(plots_dir, f"classification_diagnostics_{tag}.json")
         with open(report_path, "w", encoding="utf-8") as f:
