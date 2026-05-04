@@ -26,6 +26,9 @@ venv/
 env/
 ENV/
 
+# Plots
+plots/
+
 # PyTorch
 *.pth
 *.pt
@@ -68,3 +71,9 @@ models/weights/
 # Profiling outputs
 *.prof
 *.profile
+
+#helpers
+/docs/notes.md
+
+#starter
+original/
