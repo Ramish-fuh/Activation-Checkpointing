@@ -11,6 +11,7 @@ Outputs:
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import os
@@ -51,7 +52,14 @@ def _ensure_matplotlib():
     return plt
 
 
-def _profile_experiment(model_name: str, batch_size: int) -> Dict[str, Any]:
+def _parse_budget_fraction(value: str) -> float:
+    value = value.strip()
+    if value.endswith("%"):
+        return float(value[:-1]) / 100.0
+    return float(value)
+
+
+def _profile_experiment(model_name: str, batch_size: int, budget_fraction: float) -> Dict[str, Any]:
     experiment = Experiment(model_name, batch_size)
     experiment.init_opt_states()
 
@@ -84,7 +92,7 @@ def _profile_experiment(model_name: str, batch_size: int) -> Dict[str, Any]:
 
     diagnostics = _build_phase1_diagnostics(profiler)
 
-    config = PolicyConfig(default_memory_budget_fraction=0.5)
+    config = PolicyConfig(default_memory_budget_fraction=budget_fraction)
     plan = build_checkpoint_plan(profiler, config)
     _log(f"checkpoint plan built with {len(plan.recompute_nodes)} recompute nodes; validating")
     report = validate_checkpoint_plan(profiler, plan, config)
@@ -118,6 +126,7 @@ def _profile_experiment(model_name: str, batch_size: int) -> Dict[str, Any]:
     return {
         "model_name": model_name,
         "batch_size": batch_size,
+        "budget_fraction": float(budget_fraction),
         "diagnostics": diagnostics,
         "checkpoint_report": report.to_dict(),
         "latency": latency,
@@ -268,7 +277,11 @@ def _save_summary_table(results: Sequence[Dict[str, Any]], save_path: str, model
     plt.close(fig)
 
 
-def generate_deliverables(model_name: str, batch_sizes: Sequence[int]) -> Dict[str, Any]:
+def generate_deliverables(
+    model_name: str,
+    batch_sizes: Sequence[int],
+    budget_fraction: float = 0.5,
+) -> Dict[str, Any]:
     if not batch_sizes:
         raise ValueError("batch_sizes must not be empty")
 
@@ -278,7 +291,7 @@ def generate_deliverables(model_name: str, batch_sizes: Sequence[int]) -> Dict[s
     results: List[Dict[str, Any]] = []
     for batch_size in batch_sizes:
         print(f"Running deliverable sweep for {model_name} bs={batch_size}", flush=True)
-        results.append(_profile_experiment(model_name, batch_size))
+        results.append(_profile_experiment(model_name, batch_size, budget_fraction))
 
     peak_plot_path = os.path.join(plots_dir, f"deliverable_peak_memory_vs_batch_size_{model_name}.png")
     forward_peak_plot_path = os.path.join(plots_dir, f"deliverable_forward_peak_vs_batch_size_{model_name}.png")
@@ -294,6 +307,7 @@ def generate_deliverables(model_name: str, batch_sizes: Sequence[int]) -> Dict[s
     summary = {
         "model_name": model_name,
         "batch_sizes": list(batch_sizes),
+        "budget_fraction": float(budget_fraction),
         "results": results,
         "artifacts": {
             "peak_memory_plot": os.path.abspath(peak_plot_path),
@@ -309,9 +323,18 @@ def generate_deliverables(model_name: str, batch_sizes: Sequence[int]) -> Dict[s
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        raise SystemExit("Usage: python deliverables.py <model_name> <batch_size> [<batch_size> ...]")
+    parser = argparse.ArgumentParser(description="Generate profiling and checkpoint deliverables")
+    parser.add_argument("model_name", help="Model name to benchmark")
+    parser.add_argument("batch_sizes", nargs="+", type=int, help="One or more batch sizes")
+    parser.add_argument(
+        "--budget",
+        default="50%",
+        help="Memory budget as a fraction (0.5) or percent string (50%%)",
+    )
+    args = parser.parse_args()
 
-    model = sys.argv[1]
-    batch_sizes = [int(arg) for arg in sys.argv[2:]]
-    generate_deliverables(model, batch_sizes)
+    budget_fraction = _parse_budget_fraction(args.budget)
+    if budget_fraction < 0 or budget_fraction > 1:
+        raise SystemExit("--budget must resolve to a value between 0 and 1")
+
+    generate_deliverables(args.model_name, args.batch_sizes, budget_fraction=budget_fraction)
