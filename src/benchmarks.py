@@ -147,158 +147,6 @@ def _build_checkpoint_diagnostics(
     }
 
 
-def _save_other_memory_plot(profiler: GraphProfiler, save_path: str, title: str) -> None:
-    try:
-        import matplotlib
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed -- skipping OTHER memory plot")
-        return
-
-    if matplotlib.get_backend().lower() != "agg":
-        matplotlib.use("Agg", force=True)
-        import importlib
-        importlib.reload(plt)
-
-    decomposed = profiler._find_decomposed_parents()
-    alive = profiler._build_alive_ranges(decomposed)
-    forward_peak_step, _, _ = profiler._sweep_for_forward_peak(alive)
-
-    rows: List[Dict[str, Any]] = []
-    for node, (born, dies) in alive.items():
-        if born <= forward_peak_step <= dies and profiler.node_type.get(node, NodeType.OTHER) is NodeType.OTHER:
-            mem_bytes = int(profiler.node_mem_bytes.get(node.name, 0))
-            if mem_bytes <= 0:
-                continue
-            rows.append(
-                {
-                    "name": node.name,
-                    "memory_bytes": mem_bytes,
-                    "memory_mb": _fmt_mb(mem_bytes),
-                    "region": profiler.node_region.get(node, "?"),
-                }
-            )
-
-    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-    if not rows:
-        ax.text(0.5, 0.5, "No OTHER tensors alive at forward peak", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        rows.sort(key=lambda row: row["memory_bytes"], reverse=True)
-        rows = rows[:20]
-        labels = [row["name"] for row in reversed(rows)]
-        values = [row["memory_mb"] for row in reversed(rows)]
-        ax.barh(labels, values, color="#9467bd")
-        ax.set_xlabel("Memory (MB)")
-        ax.set_ylabel("Tensor")
-        ax.grid(axis="x", alpha=0.25)
-
-    ax.set_title(f"OTHER tensors alive at forward peak{f' -- {title}' if title else ''}")
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Saved plot: {os.path.abspath(save_path)}")
-    plt.close(fig)
-
-
-def _save_gradient_accumulation_plot(profiler: GraphProfiler, save_path: str, title: str) -> None:
-    try:
-        import matplotlib
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed -- skipping gradient accumulation plot")
-        return
-
-    if matplotlib.get_backend().lower() != "agg":
-        matplotlib.use("Agg", force=True)
-        import importlib
-        importlib.reload(plt)
-
-    decomposed = profiler._find_decomposed_parents()
-    alive = profiler._build_alive_ranges(decomposed)
-    steps, by_type_series, _ = profiler._build_memory_timeline(alive)
-    op_counts = [step + 1 for step in steps]
-    grad_mb = [series.get(NodeType.GRAD, 0) / 1024**2 for series in by_type_series]
-    param_mb = [series.get(NodeType.PARAM, 0) / 1024**2 for series in by_type_series]
-
-    fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-    ax.step(op_counts, grad_mb, where="post", linewidth=2.0, color="#ff7f0e", label="gradients")
-    ax.plot(op_counts, param_mb, linewidth=1.5, color="#1f77b4", alpha=0.9, label="parameters")
-    ax.set_xlabel("Operations")
-    ax.set_ylabel("Memory (MB)")
-    ax.set_title(f"Gradient accumulation over operations{f' -- {title}' if title else ''}")
-    ax.grid(alpha=0.3)
-    ax.legend()
-    if op_counts:
-        ax.set_xlim(1, op_counts[-1])
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Saved plot: {os.path.abspath(save_path)}")
-    plt.close(fig)
-
-
-def _save_type_growth_plot(profiler: GraphProfiler, save_path: str, title: str) -> None:
-    try:
-        import matplotlib
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("WARNING: matplotlib not installed -- skipping type growth plot")
-        return
-
-    if matplotlib.get_backend().lower() != "agg":
-        matplotlib.use("Agg", force=True)
-        import importlib
-        importlib.reload(plt)
-
-    decomposed = profiler._find_decomposed_parents()
-    alive = profiler._build_alive_ranges(decomposed)
-    steps, by_type_series, totals = profiler._build_memory_timeline(alive)
-    op_counts = [step + 1 for step in steps]
-
-    series_mb = {
-        node_type.name: [series.get(node_type, 0) / 1024**2 for series in by_type_series]
-        for node_type in NodeType
-    }
-    # note: do not plot the aggregate total series (TOTAL) — user requested removing it
-
-    fig, ax = plt.subplots(1, 1, figsize=(13, 6))
-    colors = {
-        "PARAM": "#1f77b4",
-        "ACT": "#2ca02c",
-        "GRAD": "#ff7f0e",
-        "OPT": "#8c564b",
-        "OTHER": "#9467bd",
-    }
-    for name in ["PARAM", "ACT", "GRAD", "OPT", "OTHER"]:
-        linewidth = 2.5 if name == "OTHER" else 1.8
-        alpha = 1.0 if name == "OTHER" else 0.9
-        ax.step(
-            op_counts,
-            series_mb[name],
-            where="post",
-            linewidth=linewidth,
-            color=colors[name],
-            alpha=alpha,
-            label=name,
-        )
-    ax.axvline(profiler.sep_idx + 1, color="black", linestyle=":", linewidth=1.1, label="sep")
-    ax.axvline(profiler.sep_bw_idx + 1, color="gray", linestyle=":", linewidth=1.1, label="sep_backward")
-
-    ax.set_xlabel("Operations")
-    ax.set_ylabel("Memory (MB)")
-    ax.set_title(f"Tensor-type growth over operations{f' -- {title}' if title else ''}")
-    ax.grid(alpha=0.3)
-    ax.legend(ncol=3)
-    if op_counts:
-        ax.set_xlim(1, op_counts[-1])
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Saved plot: {os.path.abspath(save_path)}")
-    plt.close(fig)
-
-
 model_names: List[str] = [
     "Bert",
     "Resnet152",
@@ -482,89 +330,7 @@ class Experiment:
             graph_profiler.aggregate_stats()
             graph_profiler.print_stats()
 
-        plots_dir = _plots_dir()
-        os.makedirs(plots_dir, exist_ok=True)
-        tag = f"{self.model_name}_bs{self.batch_size}"
-
-        save_path_fw = os.path.join(plots_dir, f"peak_memory_breakdown_fw_{tag}.png")
-        save_path_overall = os.path.join(plots_dir, f"peak_memory_breakdown_overall_{tag}.png")
-        save_path_timeline = os.path.join(plots_dir, f"memory_vs_opid_{tag}.png")
-        save_path_phase = os.path.join(plots_dir, f"memory_by_phase_{tag}.png")
-        save_path_components = os.path.join(plots_dir, f"memory_components_{tag}.png")
-        save_path_growth = os.path.join(plots_dir, f"memory_growth_{tag}.png")
-        save_path_other = os.path.join(plots_dir, f"other_memory_components_{tag}.png")
-        save_path_grad = os.path.join(plots_dir, f"gradient_accumulation_{tag}.png")
-
-        try:
-            graph_profiler.plot_peak_memory_breakdown(
-                title=f"{self.model_name} (bs={self.batch_size})",
-                save_path=save_path_fw,
-                forward_only=True,
-            )
-        except Exception as exc:
-            print(f"Warning: could not save forward-only plot: {exc}")
-
-        try:
-            graph_profiler.plot_peak_memory_breakdown(
-                title=f"{self.model_name} (bs={self.batch_size})",
-                save_path=save_path_overall,
-                forward_only=False,
-            )
-        except Exception as exc:
-            print(f"Warning: could not save overall plot: {exc}")
-
-        try:
-            graph_profiler.plot_memory_vs_opid(
-                title=f"{self.model_name} (bs={self.batch_size})",
-                save_path=save_path_timeline,
-            )
-        except Exception as exc:
-            print(f"Warning: could not save memory-vs-opid plot: {exc}")
-
-        try:
-            graph_profiler.plot_phase_memory_summary(
-                title=f"{self.model_name} (bs={self.batch_size})",
-                save_path=save_path_phase,
-            )
-        except Exception as exc:
-            print(f"Warning: could not save phase-memory plot: {exc}")
-
-        try:
-            graph_profiler.plot_memory_components_vs_opid(
-                title=f"{self.model_name} (bs={self.batch_size})",
-                save_path=save_path_components,
-            )
-        except Exception as exc:
-            print(f"Warning: could not save component-memory plot: {exc}")
-
-        try:
-            _save_type_growth_plot(graph_profiler, save_path_growth, f"{self.model_name} (bs={self.batch_size})")
-        except Exception as exc:
-            print(f"Warning: could not save type-growth plot: {exc}")
-
-        try:
-            _save_other_memory_plot(graph_profiler, save_path_other, f"{self.model_name} (bs={self.batch_size})")
-        except Exception as exc:
-            print(f"Warning: could not save OTHER-memory plot: {exc}")
-
-        try:
-            _save_gradient_accumulation_plot(graph_profiler, save_path_grad, f"{self.model_name} (bs={self.batch_size})")
-        except Exception as exc:
-            print(f"Warning: could not save gradient-accumulation plot: {exc}")
-
         diagnostics = _build_phase1_diagnostics(graph_profiler)
-
-        checkpoint_plot_paths = {
-            "forward_peak_with_checkpoint": os.path.join(
-                plots_dir, f"peak_memory_breakdown_fw_{tag}_with_checkpoint.png"
-            ),
-            "overall_peak_with_checkpoint": os.path.join(
-                plots_dir, f"peak_memory_breakdown_overall_{tag}_with_checkpoint.png"
-            ),
-            "memory_vs_opid_with_checkpoint": os.path.join(
-                plots_dir, f"memory_vs_opid_{tag}_with_checkpoint.png"
-            ),
-        }
 
         checkpoint_plan = None
         checkpoint_report = None
@@ -591,36 +357,7 @@ class Experiment:
                     "ok": smoke_ok,
                     "message": smoke_message,
                 }
-                if smoke_ok:
-                    try:
-                        graph_profiler.plot_peak_memory_breakdown(
-                            title=f"{self.model_name} (bs={self.batch_size})",
-                            save_path=checkpoint_plot_paths["forward_peak_with_checkpoint"],
-                            forward_only=True,
-                            checkpoint_plan=checkpoint_plan,
-                        )
-                    except Exception as exc:
-                        print(f"Warning: could not save checkpoint forward plot: {exc}")
-
-                    try:
-                        graph_profiler.plot_peak_memory_breakdown(
-                            title=f"{self.model_name} (bs={self.batch_size})",
-                            save_path=checkpoint_plot_paths["overall_peak_with_checkpoint"],
-                            forward_only=False,
-                            checkpoint_plan=checkpoint_plan,
-                        )
-                    except Exception as exc:
-                        print(f"Warning: could not save checkpoint overall plot: {exc}")
-
-                    try:
-                        graph_profiler.plot_memory_vs_opid(
-                            title=f"{self.model_name} (bs={self.batch_size})",
-                            save_path=checkpoint_plot_paths["memory_vs_opid_with_checkpoint"],
-                            checkpoint_plan=checkpoint_plan,
-                        )
-                    except Exception as exc:
-                        print(f"Warning: could not save checkpoint memory-vs-opid plot: {exc}")
-                else:
+                if not smoke_ok:
                     checkpoint_warning = smoke_message
                     print(f"Warning: checkpointed graph smoke check failed: {smoke_message}")
             elif checkpoint_report is not None and not checkpoint_report.ok:
@@ -635,20 +372,7 @@ class Experiment:
 
         diagnostics["model_name"] = self.model_name
         diagnostics["batch_size"] = self.batch_size
-        diagnostics["plot_files"] = {
-            "forward_peak": os.path.abspath(save_path_fw),
-            "overall_peak": os.path.abspath(save_path_overall),
-            "memory_vs_opid": os.path.abspath(save_path_timeline),
-            "phase_memory": os.path.abspath(save_path_phase),
-            "components": os.path.abspath(save_path_components),
-            "growth": os.path.abspath(save_path_growth),
-            "other_memory_components": os.path.abspath(save_path_other),
-            "gradient_accumulation": os.path.abspath(save_path_grad),
-        }
-        if checkpoint_plan is not None:
-            diagnostics["plot_files"].update(
-                {k: os.path.abspath(v) for k, v in checkpoint_plot_paths.items()}
-            )
+        diagnostics["plot_files"] = {}
 
         report_path = os.path.join(plots_dir, f"classification_diagnostics_{tag}.json")
         with open(report_path, "w", encoding="utf-8") as f:
