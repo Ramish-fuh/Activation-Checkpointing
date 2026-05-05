@@ -754,28 +754,37 @@ class GraphProfiler(fx.Interpreter):
         self,
         alive: Dict[fx.Node, Tuple[int, int]],
     ) -> Tuple[int, Dict[NodeType, int]]:
-        """Sweep the node timeline to find peak alive memory.
+        """Sweep the node timeline to find peak alive memory (optimized with events).
 
-        At each step, sum bytes for nodes whose lifetime window covers that
-        step and accumulate bytes by ``NodeType``. Returns the maximum total
-        bytes and the per-type breakdown at that peak step.
+        Uses event-based sweep: track birth/death of each node, accumulate on-the-fly.
+        Reduces O(n*m) to O((n+m)*log(n+m)) with sorting.
         """
+        events: List[Tuple[int, int, fx.Node]] = []  # (step, kind, node): kind=0 for birth, 1 for death
+        for node, (born, dies) in alive.items():
+            events.append((born, 0, node))  # birth event
+            events.append((dies + 1, 1, node))  # death event (exclusive upper bound)
+
+        events.sort()
+
         peak_bytes = 0
-        peak_bd:   Dict[NodeType, int] = {}
+        peak_bd: Dict[NodeType, int] = {}
+        current_by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+        current_total = 0
 
-        for step in range(len(self.node_list)):
-            total   = 0
-            by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+        for step, kind, node in events:
+            if step < len(self.node_list):
+                sz = self.node_mem_bytes[node.name]
+                nt = self.node_type.get(node, NodeType.OTHER)
+                if kind == 0:  # birth
+                    current_total += sz
+                    current_by_type[nt] = current_by_type.get(nt, 0) + sz
+                else:  # death
+                    current_total -= sz
+                    current_by_type[nt] = current_by_type.get(nt, 0) - sz
 
-            for node, (born, dies) in alive.items():
-                if born <= step <= dies:
-                    sz = self.node_mem_bytes[node.name]
-                    total += sz
-                    by_type[self.node_type.get(node, NodeType.OTHER)] += sz
-
-            if total > peak_bytes:
-                peak_bytes = total
-                peak_bd    = by_type
+                if current_total > peak_bytes:
+                    peak_bytes = current_total
+                    peak_bd = dict(current_by_type)
 
         return peak_bytes, peak_bd
 
@@ -783,29 +792,48 @@ class GraphProfiler(fx.Interpreter):
         self,
         alive: Dict[fx.Node, Tuple[int, int]],
     ) -> Tuple[int, int, Dict[NodeType, int]]:
-        """Sweep only the forward-pass region to find peak memory in forward.
+        """Sweep forward-pass region to find peak memory (optimized with events).
 
-        Sweeps steps 0 to ``sep_idx`` (inclusive) to track maximum memory
-        reached during forward pass only. Returns ``(peak_step, peak_bytes, breakdown)``.
+        Uses event-based sweep for efficiency.
         """
-        peak_step  = -1
+        forward_end = min(self.sep_idx + 1, len(self.node_list))
+
+        events: List[Tuple[int, int, fx.Node]] = []
+        for node, (born, dies) in alive.items():
+            if born < forward_end and dies >= 0:
+                events.append((max(0, born), 0, node))  # birth event
+                events.append((min(dies + 1, forward_end), 1, node))  # death event
+
+        events.sort()
+
+        peak_step = -1
         peak_bytes = 0
-        peak_bd:   Dict[NodeType, int] = {}
+        peak_bd: Dict[NodeType, int] = {}
+        current_by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+        current_total = 0
+        current_step = 0
 
-        for step in range(min(self.sep_idx + 1, len(self.node_list))):
-            total   = 0
-            by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+        for step, kind, node in events:
+            # Track the step when this max is reached
+            if step < forward_end and current_total > peak_bytes:
+                peak_bytes = current_total
+                peak_bd = dict(current_by_type)
+                peak_step = current_step
 
-            for node, (born, dies) in alive.items():
-                if born <= step <= dies:
-                    sz = self.node_mem_bytes[node.name]
-                    total += sz
-                    by_type[self.node_type.get(node, NodeType.OTHER)] += sz
+            sz = self.node_mem_bytes[node.name]
+            nt = self.node_type.get(node, NodeType.OTHER)
+            if kind == 0:  # birth
+                current_total += sz
+                current_by_type[nt] = current_by_type.get(nt, 0) + sz
+                current_step = step
+            else:  # death
+                current_total -= sz
+                current_by_type[nt] = current_by_type.get(nt, 0) - sz
 
-            if total > peak_bytes:
-                peak_bytes = total
-                peak_bd    = by_type
-                peak_step  = step
+        if current_total > peak_bytes and current_step < forward_end:
+            peak_bytes = current_total
+            peak_bd = dict(current_by_type)
+            peak_step = current_step
 
         return peak_step, peak_bytes, peak_bd
 
@@ -899,22 +927,44 @@ class GraphProfiler(fx.Interpreter):
         self,
         alive: Dict[fx.Node, Tuple[int, int]],
     ) -> Tuple[List[int], List[Dict[NodeType, int]], List[int]]:
-        """Return per-step memory timeline as (steps, by_type, totals)."""
+        """Return per-step memory timeline (optimized with events).
+        
+        Builds full timeline using event sweep: O((n+m)*log(n+m)) instead of O(n*m).
+        """
         steps = list(range(len(self.node_list)))
+        
+        # Build events for birth/death at each step
+        events: List[Tuple[int, int, fx.Node]] = []
+        for node, (born, dies) in alive.items():
+            events.append((born, 0, node))  # birth at step born
+            events.append((dies + 1, 1, node))  # death after step dies (exclusive)
+        
+        events.sort()
+        
         by_type_series: List[Dict[NodeType, int]] = []
         totals: List[int] = []
-
+        
+        current_by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
+        current_total = 0
+        event_idx = 0
+        
         for step in steps:
-            by_type: Dict[NodeType, int] = {nt: 0 for nt in NodeType}
-            total = 0
-            for node, (born, dies) in alive.items():
-                if born <= step <= dies:
-                    sz = self.node_mem_bytes[node.name]
-                    total += sz
-                    by_type[self.node_type.get(node, NodeType.OTHER)] += sz
-            by_type_series.append(by_type)
-            totals.append(total)
-
+            # Process all events at this step
+            while event_idx < len(events) and events[event_idx][0] == step:
+                _, kind, node = events[event_idx]
+                sz = self.node_mem_bytes[node.name]
+                nt = self.node_type.get(node, NodeType.OTHER)
+                if kind == 0:  # birth
+                    current_total += sz
+                    current_by_type[nt] = current_by_type.get(nt, 0) + sz
+                else:  # death
+                    current_total -= sz
+                    current_by_type[nt] = current_by_type.get(nt, 0) - sz
+                event_idx += 1
+            
+            by_type_series.append(dict(current_by_type))
+            totals.append(current_total)
+        
         return steps, by_type_series, totals
 
     # ------------------------------------------------------------------

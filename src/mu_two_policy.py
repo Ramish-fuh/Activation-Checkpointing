@@ -299,6 +299,10 @@ def _select_recompute_nodes(
     ``delta_peak / recompute_time_ms`` until the configured memory budget is
     met or no remaining candidate can reduce the simulated peak.
     """
+    print(
+        f"[mu_two_policy] analyzing baseline memory: candidates={len(candidates)}",
+        flush=True,
+    )
     decomposed = graph_profiler._find_decomposed_parents()
     baseline_alive = graph_profiler._build_alive_ranges(decomposed)
     estimated_peak_before = _compute_peak_from_alive(
@@ -314,11 +318,43 @@ def _select_recompute_nodes(
     memory_limit_bytes = _resolve_memory_limit_bytes(estimated_peak_before, config)
     if not candidates:
         return 0, 0.0, estimated_peak_before, memory_limit_bytes
+    print(
+        f"[mu_two_policy] baseline computed; starting selection loop",
+        flush=True,
+    )
+
+    print(
+        f"[mu_two_policy] selecting recompute nodes: candidates={len(candidates)} "
+        f"memory_limit={_fmt_bytes(memory_limit_bytes)} "
+        f"baseline_peak={_fmt_bytes(estimated_peak_before)}",
+        flush=True,
+    )
+
+    # Large graphs can make the greedy search explode because every trial
+    # rebuilds checkpoint-aware lifetimes and re-sweeps memory. Keep the small
+    # graph behavior intact, but tighten the search budget once the activation
+    # set grows beyond a practical threshold.
+    large_graph = len(candidates) > 256
+    effective_min_candidate_mem_bytes = max(
+        int(config.min_candidate_mem_bytes),
+        4 * 1024 * 1024 if large_graph else 0,
+    )
+    effective_max_simulation_candidates = config.max_simulation_candidates
+    effective_max_selection_steps = config.max_selection_steps
+    if large_graph:
+        if effective_max_simulation_candidates <= 0:
+            effective_max_simulation_candidates = 16
+        else:
+            effective_max_simulation_candidates = min(effective_max_simulation_candidates, 16)
+        if effective_max_selection_steps <= 0:
+            effective_max_selection_steps = 4
+        else:
+            effective_max_selection_steps = min(effective_max_selection_steps, 4)
 
     usable = [
         row
         for row in candidates
-        if row.mem >= max(0, config.min_candidate_mem_bytes)
+        if row.mem >= effective_min_candidate_mem_bytes
         and not _is_param_only_candidate(graph_profiler, row)
         and not _is_alias_candidate(graph_profiler, row)
     ]
@@ -334,11 +370,18 @@ def _select_recompute_nodes(
         ),
         reverse=True,
     )
-    if config.max_simulation_candidates > 0:
-        ordered = ordered[: config.max_simulation_candidates]
+    if effective_max_simulation_candidates > 0:
+        ordered = ordered[: effective_max_simulation_candidates]
 
     all_activations = set(retained)
     remaining: List[CandidateRow] = list(ordered)
+
+    if large_graph:
+        print(
+            f"[mu_two_policy] large-graph mode active: usable={len(usable)} "
+            f"sim_candidates={len(remaining)} max_steps={effective_max_selection_steps}",
+            flush=True,
+        )
 
     current_peak = int(estimated_peak_before)
     selected_recompute_ms = 0.0
@@ -348,7 +391,7 @@ def _select_recompute_nodes(
     while (
         current_peak > memory_limit_bytes
         and remaining
-        and (config.max_selection_steps <= 0 or selected_steps < config.max_selection_steps)
+        and (effective_max_selection_steps <= 0 or selected_steps < effective_max_selection_steps)
     ):
         best_row: Optional[CandidateRow] = None
         best_trial_peak = current_peak
@@ -420,6 +463,12 @@ def _select_recompute_nodes(
         if best_row is None:
             break
 
+        print(
+            f"[mu_two_policy] step {selected_steps + 1}: selected {best_row.node.name} "
+            f"delta={_fmt_bytes(best_delta_peak)} "
+            f"peak={_fmt_bytes(best_trial_peak)}",
+            flush=True,
+        )
         recompute.add(best_row.node)
         retained.discard(best_row.node)
         selected_recompute_ms += best_trial_recompute_ms
@@ -445,6 +494,12 @@ def _select_recompute_nodes(
             )
             required_inputs_map[node] = req_inputs
             selected_recompute_ms += recompute_time_ms
+
+    print(
+        f"[mu_two_policy] selection complete: recompute={len(recompute)} "
+        f"saved={_fmt_bytes(selected_peak_drop)} final_peak={_fmt_bytes(current_peak)}",
+        flush=True,
+    )
 
     return max(0, selected_peak_drop), selected_recompute_ms, int(current_peak), memory_limit_bytes
 
@@ -749,6 +804,12 @@ def build_checkpoint_plan(
     config = config or PolicyConfig()
     _validate_profiler_contract(graph_profiler)
 
+    print(
+        f"[mu_two_policy] building checkpoint plan: region={config.optimize_region} "
+        f"budget={config.default_memory_budget_fraction:.2f}",
+        flush=True,
+    )
+
     activations = [
         n
         for n in graph_profiler.intermediate_nodes
@@ -760,6 +821,11 @@ def build_checkpoint_plan(
     required_inputs_map: Dict[Any, Set[Any]] = {}
 
     candidates = _collect_policy_candidates(graph_profiler, activations)
+    print(
+        f"[mu_two_policy] candidate activations={len(activations)} "
+        f"eligible_for_search={len(candidates)}",
+        flush=True,
+    )
     (
         selected_mem_bytes,
         selected_recompute_ms,

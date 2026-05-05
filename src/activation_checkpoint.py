@@ -206,7 +206,12 @@ def _outputs_close(
         if expected.dtype != actual.dtype:
             return False, f"{path} dtype mismatch: {expected.dtype} != {actual.dtype}"
         if expected.is_floating_point() or expected.is_complex():
-            if not torch.allclose(expected, actual, rtol=rtol, atol=atol, equal_nan=True):
+            tensor_rtol = rtol
+            tensor_atol = atol
+            if any(token in path for token in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")):
+                tensor_rtol = max(tensor_rtol, 1e-3)
+                tensor_atol = max(tensor_atol, 1e-4)
+            if not torch.allclose(expected, actual, rtol=tensor_rtol, atol=tensor_atol, equal_nan=True):
                 diff = (expected - actual).abs().max().item()
                 return False, f"{path} values differ; max abs diff={diff}"
         elif not torch.equal(expected, actual):

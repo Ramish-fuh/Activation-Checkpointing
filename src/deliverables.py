@@ -55,12 +55,17 @@ def _profile_experiment(model_name: str, batch_size: int) -> Dict[str, Any]:
     experiment = Experiment(model_name, batch_size)
     experiment.init_opt_states()
 
+    def _log(message: str) -> None:
+        print(f"[{model_name} bs={batch_size}] {message}", flush=True)
+
+    _log("starting graph compilation")
     compiled = _compile(
         experiment.train_step,
         experiment.model,
         experiment.optimizer,
         experiment.example_inputs,
     )
+    _log("graph compiled; beginning profiler warmup")
     baseline_gm = copy.deepcopy(compiled.gm)
     flat_inputs = compiled.flat_state + pytree.tree_flatten(
         [(experiment.model, experiment.optimizer, experiment.example_inputs), {}]
@@ -70,23 +75,28 @@ def _profile_experiment(model_name: str, batch_size: int) -> Dict[str, Any]:
     with torch.no_grad():
         for _ in range(2):
             profiler.run(*flat_inputs)
+        _log("warmup complete; collecting profiling runs")
         profiler.reset_stats()
         for _ in range(3):
             profiler.run(*flat_inputs)
         profiler.aggregate_stats()
+    _log("profiling complete; building checkpoint plan")
 
     diagnostics = _build_phase1_diagnostics(profiler)
 
     config = PolicyConfig(default_memory_budget_fraction=0.5)
     plan = build_checkpoint_plan(profiler, config)
+    _log(f"checkpoint plan built with {len(plan.recompute_nodes)} recompute nodes; validating")
     report = validate_checkpoint_plan(profiler, plan, config)
     diagnostics["checkpoint"] = _build_checkpoint_diagnostics(profiler, plan, report)
 
     if not report.ok:
         raise RuntimeError(report.format_summary())
+    _log("checkpoint plan validated")
 
     checkpoint_gm = copy.deepcopy(compiled.gm)
     if plan.recompute_nodes:
+        _log("applying checkpoint rewrite and running smoke check")
         checkpoint_gm = apply_checkpoint_plan(checkpoint_gm, plan)
         smoke_ok, smoke_message = smoke_check_graph(
             checkpoint_gm,
@@ -99,8 +109,11 @@ def _profile_experiment(model_name: str, batch_size: int) -> Dict[str, Any]:
         }
         if not smoke_ok:
             raise RuntimeError(f"Checkpoint smoke check failed: {smoke_message}")
+        _log("smoke check passed")
 
+    _log("measuring latency comparison")
     latency = experiment._measure_latency_comparison(baseline_gm, checkpoint_gm, flat_inputs)
+    _log("latency measurement complete")
 
     return {
         "model_name": model_name,
@@ -264,7 +277,7 @@ def generate_deliverables(model_name: str, batch_sizes: Sequence[int]) -> Dict[s
 
     results: List[Dict[str, Any]] = []
     for batch_size in batch_sizes:
-        print(f"Running deliverable sweep for {model_name} bs={batch_size}")
+        print(f"Running deliverable sweep for {model_name} bs={batch_size}", flush=True)
         results.append(_profile_experiment(model_name, batch_size))
 
     peak_plot_path = os.path.join(plots_dir, f"deliverable_peak_memory_vs_batch_size_{model_name}.png")
