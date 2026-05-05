@@ -11,7 +11,7 @@ from graph_prof import NodeType
 class PolicyConfig:
     memory_limit_bytes: Optional[int] = None
     default_memory_budget_fraction: float = 0.5
-    optimize_region: str = "forward"
+    optimize_region: str = "forward" # Options: "forward" (default), "overall"
     reject_overall_peak_increase: bool = True
     max_simulation_candidates: int = 64
     max_selection_steps: int = 16
