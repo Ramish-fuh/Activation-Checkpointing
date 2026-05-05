@@ -48,6 +48,8 @@ data/
 # Results
 results/
 *.png
+!Analyze/
+!Analyze/**
 *.jpg
 *.pdf
 !CS_265_Systems_Project_Description.pdf
