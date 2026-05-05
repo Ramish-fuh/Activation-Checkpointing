@@ -374,6 +374,9 @@ class Experiment:
         diagnostics["batch_size"] = self.batch_size
         diagnostics["plot_files"] = {}
 
+        plots_dir = _plots_dir()
+        os.makedirs(plots_dir, exist_ok=True)
+        tag = f"{self.model_name}_bs{self.batch_size}"
         report_path = os.path.join(plots_dir, f"classification_diagnostics_{tag}.json")
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(diagnostics, f, indent=2)
