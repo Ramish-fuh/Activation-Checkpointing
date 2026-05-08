@@ -1,6 +1,5 @@
 # Experimental Analysis
 
-This section summarizes the Phase 1 profiling results for BERT and ResNet152 with and without activation checkpointing (AC). The goal is to show how AC changes peak memory and iteration latency as mini-batch size grows, and to connect those trends back to the static profiling diagnostics.
 
 ## 1. Profiling and Static Analysis Summary
 
