@@ -36,7 +36,7 @@ The profiler traces one full training step, including forward, backward, and opt
 | 8  | 608.4  | 584.4  | 24.0 |
 | 16 | 1070.6 | 1002.6 | 68.0 |
 
-![BERT peak memory comparison](../Analyze/Bert/deliverable_peak_memory_vs_batch_size_Bert.png)
+![BERT peak memory comparison](/Analyze/Bert/deliverable_peak_memory_vs_batch_size_Bert.png)
 
 **Interpretation:**
 - Peak memory increases with batch size as expected.
