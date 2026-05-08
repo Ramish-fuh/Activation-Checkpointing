@@ -51,7 +51,7 @@ The profiler traces one full training step, including forward, backward, and opt
 | 8  | 2218.7 | 2218.7 | 0.0 |
 | 16 | 3397.3 | 3201.3 | 196.0 |
 
-![ResNet152 peak memory comparison](../Analyze/Resnet/deliverable_peak_memory_vs_batch_size_Resnet152.png)
+![ResNet152 peak memory comparison](/Analyze/Resnet/deliverable_peak_memory_vs_batch_size_Resnet152.png)
 
 **Interpretation:**
 - ResNet152 shows a stronger memory footprint than BERT overall.
@@ -68,7 +68,7 @@ The profiler traces one full training step, including forward, backward, and opt
 | 8  | 44.08 | 50.52 | 6.44 | 14.61% |
 | 16 | 80.36 | 81.11 | 0.75 | 0.93% |
 
-![BERT iteration latency comparison](../Analyze/Bert/deliverable_iteration_latency_vs_batch_size_Bert.png)
+![BERT iteration latency comparison](/Analyze/Bert/deliverable_iteration_latency_vs_batch_size_Bert.png)
 
 ### ResNet152
 
@@ -78,7 +78,7 @@ The profiler traces one full training step, including forward, backward, and opt
 | 8  | 233.34 | 236.22 | 2.88 | 1.24% |
 | 16 | 386.07 | 389.66 | 3.59 | 0.93% |
 
-![ResNet152 iteration latency comparison](../Analyze/Resnet/deliverable_iteration_latency_vs_batch_size_Resnet152.png)
+![ResNet152 iteration latency comparison](/Analyze/Resnet/deliverable_iteration_latency_vs_batch_size_Resnet152.png)
 
 **Interpretation:**
 - Latency rises with batch size for both models, which is expected.
