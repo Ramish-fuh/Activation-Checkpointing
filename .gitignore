@@ -79,3 +79,4 @@ models/weights/
 
 #starter
 original/
+*.github/
