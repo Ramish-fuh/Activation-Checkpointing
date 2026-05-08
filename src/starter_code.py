@@ -10,7 +10,6 @@ import torch.nn as nn
 
 from graph_prof import GraphProfiler
 from graph_tracer import SEPFunction, compile
-from utils import get_device, get_optimizer_kwargs
 
 # This is the dummy model that is for use in starter code. But we will
 # experiment with Resnet and Transformer model.
@@ -104,12 +103,13 @@ def experiment():
     dim = 100
     num_iters = 5
 
-    device_str = str(get_device())
+    device_str = 'cuda:0'
     model = DummyModel(dim=dim, layers=layers).to(device_str)
     batch = torch.randn(batch_size, dim).to(device_str)
     optim = torch.optim.Adam(
         model.parameters(), lr=0.01,
-        **get_optimizer_kwargs()
+        foreach=True,  # fused=True,
+        capturable=True
     )
 
     for param in model.parameters():

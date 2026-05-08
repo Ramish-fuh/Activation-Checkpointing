@@ -26,6 +26,9 @@ venv/
 env/
 ENV/
 
+# Plots
+plots/
+
 # PyTorch
 *.pth
 *.pt
@@ -45,6 +48,8 @@ data/
 # Results
 results/
 *.png
+!Analyze/
+!Analyze/**
 *.jpg
 *.pdf
 !CS_265_Systems_Project_Description.pdf
@@ -68,3 +73,9 @@ models/weights/
 # Profiling outputs
 *.prof
 *.profile
+
+#helpers
+/docs/notes.md
+
+#starter
+original/
